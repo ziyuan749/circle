@@ -73,6 +73,10 @@ function chatHomePath() {
   return activeChatCircle?.id ? `/group/${activeChatCircle.id}` : "/chat";
 }
 
+function juniorLevel() {
+  return Math.max(1, Number(profile?.level || 1) - 1);
+}
+
 function layout(content, options = {}) {
   const logged = Boolean(user);
   app.innerHTML = `
@@ -82,7 +86,7 @@ function layout(content, options = {}) {
           <a class="brand" href="#/home">circle</a>
           <nav class="main-nav">
             ${logged ? nav("/home", "今日") : ""}
-            ${logged ? `<a class="nav-item ${routePath().startsWith("/chat") || routePath().startsWith("/group") ? "active" : ""}" href="#${chatHomePath()}">聊天 Circle</a>` : ""}
+            ${logged ? `<a class="nav-item ${routePath().startsWith("/chat") || routePath().startsWith("/group") || routePath().startsWith("/observe") ? "active" : ""}" href="#${chatHomePath()}">聊天 Circle</a>` : ""}
             ${logged ? nav("/tasks", "任务") : ""}
             ${logged ? nav("/mine", "我的") : ""}
             ${logged ? nav("/profile", "主页") : ""}
@@ -228,6 +232,30 @@ async function taskSubmissions(taskId) {
   return data || [];
 }
 
+async function juniorChatCircles() {
+  if (!profile || Number(profile.level || 1) <= 1) return [];
+  const targetLevel = juniorLevel();
+  const { data, error } = await db
+    .from("groups")
+    .select("id, name, topic, level, circle_type, max_members, status, created_at")
+    .eq("circle_type", "exploration")
+    .eq("level", targetLevel)
+    .in("status", ["forming", "active", "full"])
+    .order("created_at", { ascending: false });
+  if (error) return [];
+
+  const rows = [];
+  for (const group of data || []) {
+    const { count } = await db
+      .from("group_members")
+      .select("id", { count: "exact", head: true })
+      .eq("group_id", group.id)
+      .eq("status", "active");
+    rows.push({ ...group, member_count: count || 0 });
+  }
+  return rows;
+}
+
 async function renderRoute() {
   if (refreshTimer) {
     clearInterval(refreshTimer);
@@ -238,6 +266,7 @@ async function renderRoute() {
     if (path === "/" || path === "/home") return pageHome();
     if (path === "/login") return pageLogin();
     if (path === "/chat") return pageChatLobby();
+    if (path === "/observe") return pageJuniorObserve();
     if (path === "/tasks") return pageTasks();
     if (path === "/mine") return pageMine();
     if (path === "/profile") return pageProfile();
@@ -310,7 +339,7 @@ async function logout() {
 
 async function pageHome() {
   if (!(await requireUser())) return;
-  const [mine, invites, subs] = await Promise.all([memberships(), pendingInvites(), mySubmissions(5)]);
+  const [mine, invites, subs, juniorCircles] = await Promise.all([memberships(), pendingInvites(), mySubmissions(5), juniorChatCircles()]);
   const chat = mine.find(m => m.groups?.circle_type === "exploration")?.groups;
   const taskCircles = mine.filter(m => m.groups?.circle_type === "task");
 
@@ -323,6 +352,7 @@ async function pageHome() {
       </div>
       <div class="hero-actions">
         <a class="primary-btn" href="#${chatHomePath()}">${chat ? "进入聊天 Circle" : "选择聊天 Circle"}</a>
+        ${Number(profile.level || 1) > 1 ? `<a class="secondary-btn" href="#/observe">观察 ${level(juniorLevel())}</a>` : ""}
         <a class="secondary-btn" href="#/tasks">看同级任务</a>
       </div>
     </section>
@@ -331,7 +361,7 @@ async function pageHome() {
       <div><strong>${chat ? "1" : "0"}</strong><span>长期聊天 Circle</span></div>
       <div><strong>${taskCircles.length}</strong><span>进行中任务 Circle</span></div>
       <div><strong>${subs.length}</strong><span>主页成果</span></div>
-      <div><strong>${invites.length}</strong><span>升级邀请</span></div>
+      <div><strong>${Number(profile.level || 1) > 1 ? juniorCircles.length : invites.length}</strong><span>${Number(profile.level || 1) > 1 ? "可观察 junior Circle" : "升级邀请"}</span></div>
     </section>
 
     <section class="two-col">
@@ -358,6 +388,22 @@ async function pageHome() {
         ${taskCircles.slice(0, 3).map(m => circleCard(m.groups, m.groups.task?.title || "")).join("") || `<p class="muted">当前没有进行中的任务 Circle。</p>`}
       </div>
     </section>
+
+    ${Number(profile.level || 1) > 1 ? `
+      <section class="panel" style="margin-top:16px">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">junior observation</p>
+            <h2>观察下一级聊天 Circle</h2>
+          </div>
+          <a class="text-btn" href="#/observe">查看全部</a>
+        </div>
+        <p class="muted">你当前是 ${level(profile.level)}，可以查看 ${level(juniorLevel())} 的聊天记录，并给表现好的成员发升级邀请。</p>
+        <div class="list">
+          ${juniorCircles.slice(0, 3).map(group => observeCircleCard(group)).join("") || `<p class="muted">下一级还没有活跃聊天 Circle。</p>`}
+        </div>
+      </section>
+    ` : ""}
 
     ${invites.length ? `
       <section class="panel">
@@ -399,9 +445,27 @@ function circleCard(group, detail = "") {
   `;
 }
 
+function observeCircleCard(group) {
+  return `
+    <article class="mini-card observe-card">
+      <div class="pill-row">
+        <span class="pill warm">Junior 聊天</span>
+        <span class="pill good">${level(group.level)}</span>
+        <span class="pill">${group.member_count || 0}/${group.max_members}</span>
+      </div>
+      <h3>${h(group.name)}</h3>
+      <p>${h(group.topic || "下一级聊天 Circle")}</p>
+      <div class="button-row">
+        <a class="secondary-btn" href="#/group/${group.id}">只读观察</a>
+      </div>
+    </article>
+  `;
+}
+
 async function pageChatLobby() {
   if (!(await requireUser())) return;
   const mine = await memberships();
+  const juniorCircles = await juniorChatCircles();
   const chat = mine.find(m => m.groups?.circle_type === "exploration")?.groups;
 
   layout(`
@@ -415,6 +479,22 @@ async function pageChatLobby() {
     </section>
 
     ${chat ? notice(`你已经在「${chat.name}」。如果要换方向，需要先进入当前 Circle 并退出。`) : ""}
+
+    ${Number(profile.level || 1) > 1 ? `
+      <section class="panel" style="margin-top:16px">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">junior observation</p>
+            <h2>观察 ${level(juniorLevel())} 聊天 Circle</h2>
+          </div>
+          <a class="text-btn" href="#/observe">查看全部</a>
+        </div>
+        <p class="muted">这里不是让不同层级混聊，而是让 senior 观察 junior 的真实讨论，再邀请高质量成员升级。</p>
+        <div class="card-grid compact-grid">
+          ${juniorCircles.slice(0, 2).map(group => observeCircleCard(group)).join("") || `<p class="muted">下一级还没有活跃聊天 Circle。</p>`}
+        </div>
+      </section>
+    ` : ""}
 
     <section class="card-grid">
       ${chatTopics.map(([topic, desc]) => `
@@ -450,6 +530,43 @@ async function pageChatLobby() {
       }
     });
   });
+}
+
+async function pageJuniorObserve() {
+  if (!(await requireUser())) return;
+  if (Number(profile.level || 1) <= 1) {
+    layout(`
+      <section class="hero-panel compact-hero">
+        <div>
+          <p class="eyebrow">junior observation</p>
+          <h1>L1 暂时没有下一级可观察</h1>
+          <p>先加入自己的聊天 Circle，完成任务成果，等待更高层用户邀请你升级。</p>
+        </div>
+        <a class="primary-btn" href="#${chatHomePath()}">回到聊天 Circle</a>
+      </section>
+    `);
+    return;
+  }
+
+  const groups = await juniorChatCircles();
+  layout(`
+    <section class="hero-panel compact-hero">
+      <div>
+        <p class="eyebrow">junior observation</p>
+        <h1>观察 ${level(juniorLevel())} 聊天 Circle</h1>
+        <p>你当前是 ${level(profile.level)}。你可以查看下一级的聊天记录，但不能直接参与聊天；如果看到有水平的人，可以在成员面板里发升级邀请。</p>
+      </div>
+      <a class="secondary-btn" href="#${chatHomePath()}">回到我的聊天 Circle</a>
+    </section>
+    <section class="card-grid">
+      ${groups.map(group => observeCircleCard(group)).join("") || `
+        <div class="panel">
+          <h2>还没有可观察的 junior Circle</h2>
+          <p class="muted">等 ${level(juniorLevel())} 用户加入聊天 Circle 后，这里会出现可观察列表。</p>
+        </div>
+      `}
+    </section>
+  `);
 }
 
 async function pageTasks() {
@@ -739,11 +856,12 @@ async function pageGroup(groupId) {
     if (!force && document.activeElement?.matches?.("#messageInput")) return;
     const [members, messages] = await Promise.all([readMembers(), readMessages()]);
     const isMember = members.some(m => m.user_id === user.id);
+    const isLowerObservedChat = !isMember && group.circle_type === "exploration" && Number(group.level || 1) < Number(profile.level || 1);
     const topic = group.circle_type === "task" ? group.task?.title : group.topic;
     layout(`
       <section class="wechat">
         <header class="chat-top">
-          <a href="#/mine" class="back-link">‹ 退出</a>
+          <a href="${isLowerObservedChat ? "#/observe" : "#/mine"}" class="back-link">‹ ${isLowerObservedChat ? "观察" : "退出"}</a>
           <div>
             <h1>${h(group.name)}</h1>
             <p>${members.length}/${group.max_members} · ${h(topic || "")}</p>
@@ -754,13 +872,16 @@ async function pageGroup(groupId) {
           <div class="pill-row">
             <span class="pill ${group.circle_type === "task" ? "dark" : "warm"}">${circleTypeName(group.circle_type)}</span>
             <span class="pill good">${level(group.level)}</span>
+            ${isLowerObservedChat ? `<span class="pill">只读观察</span>` : ""}
           </div>
           ${group.circle_type === "task" ? `<a href="#/work/${groupId}">任务工作台</a>` : ""}
           <button id="toggleMembers" type="button">展开成员与升级邀请</button>
           ${isMember ? `<button id="leaveGroup" class="danger" type="button">${group.circle_type === "task" ? "退出任务 Circle" : "退出长期聊天 Circle"}</button>` : ""}
         </div>
         <div class="chat-note">
-          ${group.circle_type === "task"
+          ${isLowerObservedChat
+            ? `只读观察：你是 ${level(profile.level)}，正在查看 ${level(group.level)} 的讨论。你不能跨层发言，但可以展开成员并邀请优秀成员升级。`
+            : group.circle_type === "task"
             ? `任务：${h(group.task?.deliverable || "提交小组成果。")} <a href="#/work/${groupId}">去提交</a>`
             : "长期聊天 Circle：这里是主要关系沉淀区，建议保持稳定参与。"}
         </div>
