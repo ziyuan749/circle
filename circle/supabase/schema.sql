@@ -726,6 +726,28 @@ select * from (values
     4,
     3,
     'open'
+  ),
+  (
+    '设计一个投行申请者的 networking 系统',
+    '请围绕目标名单、触达话术、跟进节奏、信息记录和 referral 转化设计一个可执行系统。',
+    '求职策略',
+    4,
+    '提交一份 networking operating system，包含目标分层、触达模板、跟进节奏和转化指标。',
+    100,
+    6,
+    7,
+    'open'
+  ),
+  (
+    '评估一个求职社交产品的增长飞轮',
+    '请从用户分层、留存、内容供给、任务激励、邀请机制和商业化角度评估 circle 类产品。',
+    '产品战略',
+    5,
+    '提交一份产品战略 memo，包含核心飞轮、关键风险、北极星指标和 90 天实验计划。',
+    100,
+    6,
+    7,
+    'open'
   )
 ) as v(title, description, category, level, deliverable, score_max, group_size, duration_days, status)
 where not exists (
@@ -742,9 +764,17 @@ from (values
   ('为一家中国茶饮品牌设计英国市场进入策略', 2, '提交一份市场进入方案，包含目标客群、选址逻辑、定价和前三个月行动计划。'),
   ('帮一家 AI 教育产品找到第一批用户', 2, '提交一份冷启动方案，包含首批用户画像、渠道、转化路径和留存机制。'),
   ('模拟投行面试：如何解释 DCF', 1, '提交一份面试回答框架，包含 60 秒版本、关键假设和常见追问。'),
-  ('模拟咨询 Case：估算伦敦一年卖出多少杯咖啡', 1, '提交一份 market sizing 拆解，包含公式、核心假设和 sanity check。')
+  ('模拟咨询 Case：估算伦敦一年卖出多少杯咖啡', 1, '提交一份 market sizing 拆解，包含公式、核心假设和 sanity check。'),
+  ('设计一个投行申请者的 networking 系统', 4, '提交一份 networking operating system，包含目标分层、触达模板、跟进节奏和转化指标。'),
+  ('评估一个求职社交产品的增长飞轮', 5, '提交一份产品战略 memo，包含核心飞轮、关键风险、北极星指标和 90 天实验计划。')
 ) as v(title, level, deliverable)
 where public.tasks.title = v.title;
+
+update public.tasks
+set format_guide = '建议格式：1. 一句话结论；2. 背景和目标；3. 核心分析；4. 可执行方案；5. 风险和下一步。提交链接可以是 Google Doc、Notion、PDF、Slides 或其他公开可访问材料。'
+where format_guide is null
+   or format_guide = ''
+   or format_guide = '建议格式：1. 结论摘要；2. 关键假设；3. 分析过程；4. 风险和下一步。提交链接可以是 Google Doc、Notion、PDF、Slides 或其他可访问材料。';
 
 update public.groups g
 set level = t.level
