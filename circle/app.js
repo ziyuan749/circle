@@ -19,11 +19,11 @@ const stageLabels = {
 };
 
 const stageDescriptions = {
-  1: "刚开始准备，重点是 CV、tracker、基础 networking 和 behavioral story。",
-  2: "材料基本成型，开始稳定投递、coffee chat、HireVue 和 technical 高频题。",
-  3: "已有相关经历或高质量成果，重点冲 referral、mock interview 和深度 technical。",
-  4: "能带动小队复盘、评审成果、推荐表现好的成员进入更强小队。",
-  5: "已拿到 offer 或有明确相关经验，适合做观察、点评和任务评审。"
+  1: "默认进入阶段，先把申请画像、周同步、材料和 networking 节奏跑起来。",
+  2: "Summer 申请中已经开始稳定行动的人，适合更高频讨论投递、coffee chat 和面试准备。",
+  3: "通过邀请确认的强候选人，重点交流 referral、mock interview、technical / case 和高质量复盘。",
+  4: "能带动小队复盘、推荐表现好的成员进入更强小队。",
+  5: "已拿到 offer 或有明确相关经验，适合做观察、点评和推荐。"
 };
 
 const applicationTracks = ["Spring Week", "Summer Internship"];
@@ -196,161 +196,6 @@ function suggestedActions(currentProfile = profile, checkin = null, submissions 
 
 function renderProfileChips(currentProfile = profile) {
   return matchTags(currentProfile).map(tag => `<span>${h(tag)}</span>`).join("");
-}
-
-const businessSenseDeck = [
-  {
-    roles: ["Investment Banking", "Asset Management", "Equity Research", "Sales & Trading", "General Finance"],
-    label: "市场观察",
-    title: "降息预期会怎样影响银行股估值？",
-    brief: "关注净息差、贷款需求、坏账预期、交易收入和估值倍数，而不是只说“降息利好股市”。",
-    angles: ["净息差是否被压缩", "信贷需求是否恢复", "坏账压力是否下降", "市场交易和财富管理收入是否改善"],
-    prompt: "大家用 3 分钟拆一下：如果英国进入降息周期，银行股到底是利好还是利空？分别从 NIM、贷款需求、坏账和估值说。"
-  },
-  {
-    roles: ["Investment Banking", "Equity Research", "Asset Management", "General Finance"],
-    label: "公司分析",
-    title: "一家消费公司提价后，利润一定会变好吗？",
-    brief: "提价可能提升毛利率，也可能损害销量、复购和品牌心智。要看价格弹性和渠道结构。",
-    angles: ["销量下滑幅度", "毛利率提升幅度", "竞品是否跟涨", "渠道库存和促销压力"],
-    prompt: "如果一个消费品牌涨价 10%，你会看哪些指标判断它是不是成功提价？"
-  },
-  {
-    roles: ["Consulting", "General Finance"],
-    label: "Case Sense",
-    title: "外卖平台为什么 GMV 增长但利润不一定增长？",
-    brief: "GMV 是交易额，不等于收入，更不等于利润。补贴、骑手成本、广告变现和商家佣金都会影响利润。",
-    angles: ["take rate", "补贴率", "履约成本", "广告和会员收入"],
-    prompt: "一个外卖平台 GMV 增长 20%，但利润下降，你会怎么拆原因树？"
-  },
-  {
-    roles: ["Consulting", "Investment Banking", "General Finance"],
-    label: "行业判断",
-    title: "为什么同样是 AI 公司，有些像软件，有些像服务？",
-    brief: "关键看毛利率、交付方式、客户定制化、数据/模型复用程度，以及收入是否随人力线性增长。",
-    angles: ["毛利率", "实施周期", "客户定制化", "模型和数据复用"],
-    prompt: "判断一家 AI 公司更像 SaaS 还是咨询服务，你会问哪 4 个问题？"
-  },
-  {
-    roles: ["Investment Banking", "Asset Management", "Equity Research"],
-    label: "估值直觉",
-    title: "高增长公司为什么也可能估值太贵？",
-    brief: "增长不是估值护身符。要看增长持续性、利润率终局、再投资需求和市场已经 price in 了多少。",
-    angles: ["增长可持续性", "终局利润率", "现金流转换", "估值隐含增长"],
-    prompt: "如果一家公司收入年增 40%，你怎么判断它是不是已经太贵了？"
-  },
-  {
-    roles: ["Consulting", "General Finance"],
-    label: "商业模式",
-    title: "订阅制为什么不一定比一次性销售更好？",
-    brief: "订阅制看似稳定，但要看 CAC、churn、续费率、使用频率和服务成本。",
-    angles: ["CAC 回收期", "churn", "ARPU", "服务成本"],
-    prompt: "一个教育产品从一次性收费改成订阅制，你会看哪些指标判断是否成功？"
-  }
-];
-
-function businessSenseCards(currentProfile = profile) {
-  const role = profileValue(currentProfile, "target_role", "Investment Banking");
-  const matching = businessSenseDeck.filter(card => card.roles.includes(role) || card.roles.includes("General Finance"));
-  return (matching.length ? matching : businessSenseDeck).slice(0, 4);
-}
-
-function renderBusinessSenseFeed(currentProfile = profile) {
-  return businessSenseCards(currentProfile).map(card => `
-    <article class="sense-card">
-      <div class="sense-label">${h(card.label)}</div>
-      <h3>${h(card.title)}</h3>
-      <p>${h(card.brief)}</p>
-      <div class="sense-angles">
-        ${card.angles.map(angle => `<span>${h(angle)}</span>`).join("")}
-      </div>
-      <button class="prompt-chip sense-discuss" type="button" data-prompt="${h(card.prompt)}">发到群里讨论</button>
-    </article>
-  `).join("");
-}
-
-function circleBrief(messages, checkins, members) {
-  const todayCount = messages.filter(msg => isSameLocalDay(msg.created_at)).length;
-  const activeToday = new Set(messages.filter(msg => isSameLocalDay(msg.created_at)).map(msg => msg.user_id)).size;
-  const syncedUsers = new Set(checkins.map(item => item.userId)).size;
-  const top = checkins[0];
-  const brief = [];
-  if (!messages.length) {
-    brief.push(["冷启动", "还没有讨论记录，适合先发一个具体问题，比如让大家报本周申请目标。"]);
-  } else if (todayCount < 5) {
-    brief.push(["需要点火", "今天消息偏少，可以用右侧 Business Sense 卡片或快捷问题发起一个 5 分钟讨论。"]);
-  } else {
-    brief.push(["讨论活跃", `今天已有 ${todayCount} 条消息，${activeToday} 位成员参与，可以请一个人总结当前结论。`]);
-  }
-  if (syncedUsers < Math.max(2, Math.ceil((members?.length || 6) / 2))) {
-    brief.push(["同步不足", `本周只有 ${syncedUsers} 人同步进展，建议先提醒未同步成员补申请数和卡点。`]);
-  } else {
-    brief.push(["节奏稳定", `本周已有 ${syncedUsers} 人同步进展，可以开始比较卡点并分配互助对象。`]);
-  }
-  if (top) brief.push(["当前领跑", `${top.name} 暂时领先：${top.apps} 个申请、${top.networking} 次 networking。`]);
-  return brief.slice(0, 3);
-}
-
-function renderCircleBrief(messages, checkins, members) {
-  return circleBrief(messages, checkins, members).map(([label, text]) => `
-    <div class="brief-item">
-      <span>${h(label)}</span>
-      <p>${h(text)}</p>
-    </div>
-  `).join("");
-}
-
-function applicationRadarCards(currentProfile = profile) {
-  const track = profileValue(currentProfile, "application_track", "Spring Week");
-  const progress = profileValue(currentProfile, "application_progress", "材料准备中");
-  const role = profileValue(currentProfile, "target_role", "Investment Banking");
-  const month = new Date().getMonth() + 1;
-  const cards = [];
-  if (track === "Spring Week") {
-    cards.push({
-      label: "现在重点",
-      title: month <= 8 ? "7-8 月先抢准备窗口" : "进入开放期，尽早投递",
-      text: month <= 8
-        ? "先把 CV、tracker、目标公司清单和 HireVue 故事准备好。9 月开放后再准备会很赶。"
-        : "Spring Week 很多岗位 rolling basis，开放后越早投越好。每天都要查 tracker。",
-      prompt: "大家各自发一下自己的 Spring Week tracker：目标公司、deadline、当前状态、下一步。"
-    });
-    cards.push({
-      label: "讨论主题",
-      title: progress.includes("HireVue") ? "HireVue 故事要能被追问" : "CV bullet 先做到可被别人 review",
-      text: "Spring Week 早期不用过度细分方向，先把材料、节奏和表达练起来。",
-      prompt: "今天每个人发 1 条最想改的 CV bullet，其他人只给一个具体修改建议。"
-    });
-  } else {
-    cards.push({
-      label: "现在重点",
-      title: role.includes("Consulting") ? "Summer Consulting 要固定 case 节奏" : "Summer 金融要同时推 networking 和 technical",
-      text: role.includes("Consulting")
-        ? "每周至少一次 case partner 训练，复盘结构、计算和 fit story。"
-        : "不要只刷 technical，也要固定 coffee chat 和 referral 记录。强的人通常两条线一起推。",
-      prompt: role.includes("Consulting")
-        ? "这周谁可以约一次 case partner？发一下你想练的 case 类型和空闲时间。"
-        : "大家发一下本周 networking 目标：准备联系几个人、目标 team 是什么、最卡的一步是什么？"
-    });
-    cards.push({
-      label: "升级信号",
-      title: "能稳定帮助别人，比单纯申请数更重要",
-      text: "Ready 到 Competitive 的关键不是自称更强，而是能输出成果、复盘错误、给别人具体反馈。",
-      prompt: "这周每个人给别人一条具体反馈：CV、technical、case 或 networking message 都可以。"
-    });
-  }
-  return cards;
-}
-
-function renderApplicationRadar(currentProfile = profile) {
-  return applicationRadarCards(currentProfile).map(card => `
-    <article class="radar-card">
-      <span>${h(card.label)}</span>
-      <h3>${h(card.title)}</h3>
-      <p>${h(card.text)}</p>
-      <button class="prompt-chip" type="button" data-prompt="${h(card.prompt)}">发起这个动作</button>
-    </article>
-  `).join("");
 }
 
 function circleTypeName(type) {
@@ -687,6 +532,7 @@ async function pageHome() {
   const checkins = weeklyCheckins(chatMessages);
   const myCheckin = latestCheckinForUser(checkins);
   const nextActions = suggestedActions(profile, myCheckin, subs);
+  const readyEligibility = summerReadyEligibility(profile, chatMessages, chat);
 
   layout(`
     <section class="hero-panel">
@@ -734,6 +580,8 @@ async function pageHome() {
         </article>
       </div>
     </section>
+
+    ${renderReadyUnlockCard(readyEligibility)}
 
     <section class="metrics">
       <div><strong>${chat ? "1" : "0"}</strong><span>长期聊天 Circle</span></div>
@@ -802,6 +650,7 @@ async function pageHome() {
       </section>
     ` : ""}
   `);
+  bindReadyUnlockButton();
   bindInviteButtons();
 }
 
@@ -847,20 +696,49 @@ function renderChatMessages(messages) {
     const day = messageDay(msg.created_at);
     const divider = day !== lastDay ? `<div class="day-divider"><span>${h(day)}</span></div>` : "";
     lastDay = day;
-    return `
-      ${divider}
-      <div class="bubble-line ${msg.user_id === user.id ? "mine" : ""}">
-        <div class="chat-avatar">${h((msg.profiles?.display_name || "C").slice(0, 1))}</div>
-        <div class="bubble-wrap">
-          <div class="bubble-meta">
-            <span>${h(msg.profiles?.display_name || "用户")}</span>
-            <span>${messageClock(msg.created_at)}</span>
-          </div>
-          <div class="bubble">${h(msg.content)}</div>
+    return `${divider}${renderChatBubble(msg)}`;
+  }).join("");
+}
+
+function renderChatBubble(msg) {
+  const isImage = msg.message_type === "image";
+  const isFile = msg.message_type === "file";
+  return `
+    <div class="bubble-line ${msg.user_id === user.id ? "mine" : ""}">
+      <div class="chat-avatar">${h((msg.profiles?.display_name || "C").slice(0, 1))}</div>
+      <div class="bubble-wrap">
+        <div class="bubble-meta">
+          <span>${h(msg.profiles?.display_name || "用户")}</span>
+          <span>${messageClock(msg.created_at)}</span>
+        </div>
+        <div class="bubble ${isImage ? "media-bubble" : ""}">
+          ${isImage && msg.media_url ? `
+            <a href="${h(msg.media_url)}" target="_blank" rel="noreferrer">
+              <img class="chat-image" src="${h(msg.media_url)}" alt="${h(msg.media_name || "聊天图片")}">
+            </a>
+            ${msg.content && msg.content !== msg.media_name ? `<p>${h(msg.content)}</p>` : ""}
+          ` : isFile && msg.media_url ? `
+            <a class="file-card" href="${h(msg.media_url)}" target="_blank" rel="noreferrer">
+              <span class="file-icon">FILE</span>
+              <span>
+                <strong>${h(msg.media_name || msg.content || "文件")}</strong>
+                <em>${formatFileSize(msg.media_size)} · ${h(msg.media_mime || "文件")}</em>
+              </span>
+            </a>
+            ${msg.content && msg.content !== msg.media_name ? `<p>${h(msg.content)}</p>` : ""}
+          ` : h(msg.content)}
         </div>
       </div>
-    `;
-  }).join("");
+    </div>
+  `;
+}
+
+function formatFileSize(size) {
+  const bytes = Number(size || 0);
+  if (!bytes) return "未知大小";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 102.4) / 10} KB`;
+  return `${Math.round(bytes / 1024 / 102.4) / 10} MB`;
 }
 
 function isSameLocalDay(value, date = new Date()) {
@@ -880,8 +758,16 @@ function startOfWeek(date = new Date()) {
 
 function weeklyCheckins(messages) {
   const weekStart = startOfWeek();
+  return parsedCheckins(messages, weekStart);
+}
+
+function checkinWeekKey(value) {
+  return startOfWeek(new Date(value)).toISOString().slice(0, 10);
+}
+
+function parsedCheckins(messages, fromDate = null) {
   return messages
-    .filter(msg => msg.content?.includes("【周同步】") && new Date(msg.created_at) >= weekStart)
+    .filter(msg => msg.content?.includes("【周同步】") && (!fromDate || new Date(msg.created_at) >= fromDate))
     .map(msg => {
       const apps = Number(msg.content.match(/申请[:：]\s*(\d+)/)?.[1] || 0);
       const networking = Number(msg.content.match(/Networking[:：]\s*(\d+)/i)?.[1] || 0);
@@ -893,19 +779,91 @@ function weeklyCheckins(messages) {
         apps,
         networking,
         score,
-        createdAt: msg.created_at
+        createdAt: msg.created_at,
+        weekKey: checkinWeekKey(msg.created_at)
       };
     })
     .sort((a, b) => b.score - a.score || new Date(b.createdAt) - new Date(a.createdAt));
 }
 
-function renderWeeklyRank(checkins) {
-  if (!checkins.length) return `<p class="muted compact-muted">这周还没有人同步进度。第一个同步的人会出现在这里。</p>`;
+function summerReadyEligibility(currentProfile, messages, chat) {
+  const show = profileValue(currentProfile, "application_track", "Spring Week") === "Summer Internship" &&
+    Number(currentProfile?.level || 1) === 1;
+  if (!show) return { show: false, eligible: false, checks: [] };
+
+  const profileComplete = [
+    "application_track",
+    "target_region",
+    "target_role",
+    "application_progress",
+    "intensity"
+  ].every(key => String(currentProfile?.[key] || "").trim());
+  const myCheckins = parsedCheckins(messages).filter(item => item.userId === user?.id);
+  const currentWeekCheckins = weeklyCheckins(messages).filter(item => item.userId === user?.id);
+  const currentCheckin = currentWeekCheckins[0] || null;
+  const distinctWeeks = new Set(myCheckins.map(item => item.weekKey)).size;
+  const actionSpike = Boolean(currentCheckin && (currentCheckin.apps >= 5 || currentCheckin.networking >= 3));
+  const steadySync = distinctWeeks >= 2;
+  const hasChat = Boolean(chat);
+
+  const checks = [
+    { ok: hasChat, text: "已经加入一个长期 Summer 聊天 Circle" },
+    { ok: profileComplete, text: "申请画像完整：地区、岗位、进度和强度清楚" },
+    { ok: Boolean(currentCheckin), text: "本周完成一次周同步" },
+    { ok: steadySync || actionSpike, text: "连续两周同步，或本周达到 5 个申请 / 3 次 networking" }
+  ];
+
+  return {
+    show,
+    eligible: checks.every(item => item.ok),
+    checks,
+    currentCheckin,
+    distinctWeeks
+  };
+}
+
+function renderReadyUnlockCard(eligibility) {
+  if (!eligibility?.show) return "";
+  return `
+    <section class="panel unlock-panel">
+      <div class="section-head">
+        <div>
+          <p class="eyebrow">summer stage</p>
+          <h2>Ready 解锁</h2>
+        </div>
+        <span class="pill good">Starter → Ready</span>
+      </div>
+      <p class="muted">Spring Week 先不细分层级；Summer 候选人差异更大，所以用轻量成长阶段把稳定行动的人聚到一起。</p>
+      <div class="unlock-checks">
+        ${eligibility.checks.map(item => `
+          <div class="${item.ok ? "done" : ""}">
+            <b>${item.ok ? "✓" : "·"}</b>
+            <span>${h(item.text)}</span>
+          </div>
+        `).join("")}
+      </div>
+      <div class="button-row">
+        ${eligibility.eligible
+          ? `<button class="primary-btn" id="unlockReadyBtn" type="button">解锁 Ready</button>`
+          : `<a class="secondary-btn" href="#${activeChatCircle?.id ? chatHomePath() : "/chat"}">继续完成条件</a>`}
+        <span class="muted">Competitive 以上仍然由 Peer Lead / Mentor 邀请确认。</span>
+      </div>
+    </section>
+  `;
+}
+
+function latestCheckinsByUser(checkins) {
   const latestByUser = new Map();
   checkins.forEach(item => {
     if (!latestByUser.has(item.userId)) latestByUser.set(item.userId, item);
   });
-  return [...latestByUser.values()].slice(0, 5).map((item, index) => `
+  return [...latestByUser.values()];
+}
+
+function renderWeeklyRank(checkins) {
+  const rows = latestCheckinsByUser(checkins).sort((a, b) => b.score - a.score || new Date(b.createdAt) - new Date(a.createdAt));
+  if (!rows.length) return `<p class="muted compact-muted">这周还没有人同步进度。第一个同步的人会出现在这里。</p>`;
+  return rows.slice(0, 5).map((item, index) => `
     <div class="rank-row">
       <b>#${index + 1}</b>
       <span>${h(item.name)}</span>
@@ -914,41 +872,71 @@ function renderWeeklyRank(checkins) {
   `).join("");
 }
 
+function renderMetricRank(rows, metric) {
+  const sorted = [...rows].sort((a, b) => Number(b[metric] || 0) - Number(a[metric] || 0) || new Date(b.createdAt) - new Date(a.createdAt));
+  if (!sorted.length) return `<p class="muted compact-muted">还没有周同步。</p>`;
+  return sorted.slice(0, 5).map((item, index) => `
+    <div class="rank-row">
+      <b>#${index + 1}</b>
+      <span>${h(item.name)}</span>
+      <em>${Number(item[metric] || 0)} ${metric === "apps" ? "申请" : "networking"}</em>
+    </div>
+  `).join("");
+}
+
 function latestCheckinForUser(checkins, userId = user?.id) {
   return checkins.find(item => item.userId === userId) || null;
 }
 
-function defaultActions(group) {
-  if (group.circle_type === "task") {
-    return ["确认分工", "补一条关键假设", "整理交付链接", "请一个成员 review"];
-  }
-  return ["同步今日申请数", "找 1 个材料让别人看", "发 1 个 networking 目标", "复盘一个卡点"];
+async function peerCircleLeague(group) {
+  if (!group || group.circle_type !== "exploration") return { checkins: [], groups: [], memberTotal: 0 };
+  const { data: groups, error } = await db
+    .from("groups")
+    .select("id, name, topic, level, max_members")
+    .eq("circle_type", "exploration")
+    .eq("topic", group.topic)
+    .eq("level", group.level)
+    .in("status", ["forming", "active", "full"])
+    .limit(20);
+  if (error) return { checkins: [], groups: [], memberTotal: 0 };
+  const peerGroups = groups || [];
+  const messageSets = await Promise.all(peerGroups.map(item => recentGroupMessages(item.id, 250)));
+  const allCheckins = messageSets.flatMap((messages, index) =>
+    weeklyCheckins(messages).map(checkin => ({
+      ...checkin,
+      groupId: peerGroups[index]?.id,
+      groupName: peerGroups[index]?.name
+    }))
+  );
+  return {
+    checkins: latestCheckinsByUser(allCheckins),
+    groups: peerGroups,
+    memberTotal: peerGroups.reduce((sum, item) => sum + Number(item.max_members || 0), 0)
+  };
 }
 
-function actionStorageKey(groupId) {
-  return `circle-actions:${user?.id || "anon"}:${groupId}:${new Date().toISOString().slice(0, 10)}`;
-}
-
-function readActions(groupId, group) {
-  const saved = localStorage.getItem(actionStorageKey(groupId));
-  if (saved) {
-    try {
-      const parsed = JSON.parse(saved);
-      if (Array.isArray(parsed)) return parsed;
-    } catch {
-      localStorage.removeItem(actionStorageKey(groupId));
-    }
-  }
-  return defaultActions(group).map(text => ({ text, done: false }));
-}
-
-function renderActionList(groupId, group) {
-  return readActions(groupId, group).map((item, index) => `
-    <label class="action-item">
-      <input type="checkbox" data-action-index="${index}" ${item.done ? "checked" : ""}>
-      <span>${h(item.text)}</span>
-    </label>
-  `).join("");
+function renderPeerLeague(league, currentGroup) {
+  const checkins = league?.checkins || [];
+  const syncCount = checkins.length;
+  const groupCount = league?.groups?.length || 1;
+  const capacity = league?.memberTotal || groupCount * Number(currentGroup?.max_members || 6);
+  return `
+    <div class="league-summary">
+      <div><strong>${syncCount}</strong><span>本周同步</span></div>
+      <div><strong>${groupCount}</strong><span>同类 Circle</span></div>
+      <div><strong>${capacity ? Math.round((syncCount / capacity) * 100) : 0}%</strong><span>同步率</span></div>
+    </div>
+    <div class="rank-tabs">
+      <section>
+        <h3>申请最多</h3>
+        ${renderMetricRank(checkins, "apps")}
+      </section>
+      <section>
+        <h3>Networking 最多</h3>
+        ${renderMetricRank(checkins, "networking")}
+      </section>
+    </div>
+  `;
 }
 
 async function pageChatLobby() {
@@ -1514,15 +1502,41 @@ async function pageGroup(groupId) {
   }
 
   async function readMessages() {
-    const { data, error: msgError } = await db
+    let { data, error: msgError } = await db
       .from("messages")
-      .select("id, content, created_at, user_id, profiles:user_id (display_name)")
+      .select("id, content, message_type, media_url, media_path, media_name, media_mime, media_size, created_at, user_id, profiles:user_id (display_name)")
       .eq("group_id", groupId)
       .order("created_at", { ascending: true })
       .limit(250);
+    if (msgError && /message_type|media_|column/i.test(msgError.message || "")) {
+      const fallback = await db
+        .from("messages")
+        .select("id, content, created_at, user_id, profiles:user_id (display_name)")
+        .eq("group_id", groupId)
+        .order("created_at", { ascending: true })
+        .limit(250);
+      data = fallback.data;
+      msgError = fallback.error;
+    }
     if (msgError) throw msgError;
-    return data || [];
+    const rows = data || [];
+    const mediaRows = rows.filter(msg => msg.media_path);
+    await Promise.all(mediaRows.map(async msg => {
+      const { data: signed } = await db.storage.from("chat-media").createSignedUrl(msg.media_path, 60 * 60);
+      if (signed?.signedUrl) msg.media_url = signed.signedUrl;
+    }));
+    return rows;
   }
+
+  async function refreshMessageStream(scrollToBottom = true) {
+    const scroll = document.getElementById("chatScroll");
+    if (!scroll) return;
+    const messages = await readMessages();
+    scroll.innerHTML = renderChatMessages(messages);
+    if (scrollToBottom) scroll.scrollTop = scroll.scrollHeight;
+  }
+
+  let passiveRefreshes = 0;
 
   async function paint(force = false) {
     if (routePath() !== `/group/${groupId}`) return;
@@ -1534,7 +1548,7 @@ async function pageGroup(groupId) {
       const distanceFromBottom = currentScroll.scrollHeight - currentScroll.scrollTop - currentScroll.clientHeight;
       if (distanceFromBottom > 120) return;
     }
-    const [members, messages] = await Promise.all([readMembers(), readMessages()]);
+    const [members, messages, league] = await Promise.all([readMembers(), readMessages(), peerCircleLeague(group)]);
     const isMember = members.some(m => m.user_id === user.id);
     const isLowerObservedChat = !isMember && group.circle_type === "exploration" && Number(group.level || 1) < Number(profile.level || 1);
     const topic = group.circle_type === "task" ? group.task?.title : group.topic;
@@ -1627,6 +1641,11 @@ async function pageGroup(groupId) {
             <button id="toggleMembers" type="button">展开成员与升级邀请</button>
             ${isMember ? `<button id="leaveGroup" class="danger" type="button">${group.circle_type === "task" ? "退出任务 Circle" : "退出长期聊天 Circle"}</button>` : ""}
           </div>
+          <div class="chat-context-strip">
+            <span><b>${todayMessages}</b> 今日消息</span>
+            <span><b>${activeToday}</b> 今日活跃</span>
+            <span><b>${checkins.length}</b> 本周同步</span>
+          </div>
           ${group.circle_type === "task" ? `<div class="task-shortcut"><a href="#/work/${groupId}">任务工作台</a></div>` : ""}
           <div class="member-drawer" id="memberDrawer" hidden>
             ${members.map(m => `
@@ -1655,7 +1674,8 @@ async function pageGroup(groupId) {
                 <div class="composer-row">
                   <button class="tool-btn voice-icon" type="button" aria-label="语音"></button>
                   <textarea id="messageInput" name="content" rows="1" maxlength="5000" placeholder="输入消息..."></textarea>
-                  <button class="tool-btn plus-icon" type="button" aria-label="更多"></button>
+                  <button class="tool-btn plus-icon" id="attachBtn" type="button" aria-label="上传图片或文件"></button>
+                  <input id="fileInput" class="hidden-file-input" type="file">
                   <button class="send-btn" id="sendBtn" type="submit" disabled>发送</button>
                 </div>
               </form>
@@ -1664,29 +1684,19 @@ async function pageGroup(groupId) {
         </div>
 
         <aside class="chat-feed">
-          <div class="feed-card">
-            <div class="side-title">
-              <strong>AI 小队简报</strong>
-              <span>规则生成</span>
+          ${group.circle_type === "exploration" ? `
+            <div class="feed-card">
+              <div class="side-title">
+                <strong>同类 Circle 周榜</strong>
+                <span>${h(group.topic || "Circle")}</span>
+              </div>
+              ${renderPeerLeague(league, group)}
             </div>
-            <div class="brief-list">
-              ${renderCircleBrief(messages, checkins, members)}
-            </div>
-          </div>
+          ` : ""}
 
           <div class="feed-card">
             <div class="side-title">
-              <strong>申请节点雷达</strong>
-              <span>${h(profileValue(profile, "application_track", "Spring Week"))}</span>
-            </div>
-            <div class="radar-list">
-              ${renderApplicationRadar(profile)}
-            </div>
-          </div>
-
-          <div class="feed-card">
-            <div class="side-title">
-              <strong>${group.circle_type === "task" ? "任务看板" : isLowerObservedChat ? "观察看板" : "本周进度"}</strong>
+              <strong>${group.circle_type === "task" ? "任务看板" : isLowerObservedChat ? "观察看板" : "本组周同步"}</strong>
               <span>${level(group.level)}</span>
             </div>
             ${group.circle_type === "task" ? `
@@ -1719,42 +1729,11 @@ async function pageGroup(groupId) {
               ` : ""}
               <div class="feed-block">
                 <strong>Weekly Star 规则</strong>
-                <p>暂时按申请数 ×2 + networking 数排序。之后可以加上任务成果、互助次数和 Mentor 推荐。</p>
+                <p>先只看两个清晰指标：本周申请数和 networking 数。后面再考虑任务成果、互助次数和 Mentor 推荐。</p>
               </div>
             `}
           </div>
 
-          ${isMember && !isLowerObservedChat ? `
-            <div class="feed-card">
-              <div class="side-title"><strong>今日行动</strong><span>本机保存</span></div>
-              <div class="action-list" id="actionList">
-                ${renderActionList(groupId, group)}
-              </div>
-            </div>
-          ` : ""}
-
-          <div class="feed-card sense-feed-card">
-            <div class="side-title">
-              <strong>Business Sense</strong>
-              <span>${h(profileValue(profile, "target_role", "Finance"))}</span>
-            </div>
-            <p>每天刷一点商业判断。看到有意思的问题，可以直接发到群里让小队一起拆。</p>
-            <div class="sense-feed">
-              ${renderBusinessSenseFeed(profile)}
-            </div>
-          </div>
-
-          <div class="feed-card">
-            <div class="side-title"><strong>快捷问题</strong></div>
-            <div class="prompt-list">
-              ${[
-                "今天你最需要别人帮你看什么？",
-                "这周最重要的一个申请动作是什么？",
-                "有没有一个面试问题你想练？",
-                "谁可以总结一下刚才讨论的结论？"
-              ].map(text => `<button class="prompt-chip" type="button" data-prompt="${h(text)}">${h(text)}</button>`).join("")}
-            </div>
-          </div>
         </aside>
       </section>
     `, { full: true, hideNav: true });
@@ -1769,29 +1748,6 @@ async function pageGroup(groupId) {
     const drawer = document.getElementById("memberDrawer");
     if (toggle && drawer) toggle.addEventListener("click", () => drawer.hidden = !drawer.hidden);
     if (sideToggle && drawer) sideToggle.addEventListener("click", () => drawer.hidden = !drawer.hidden);
-    document.querySelectorAll(".prompt-chip").forEach(button => {
-      button.addEventListener("click", () => {
-        const input = document.getElementById("messageInput");
-        if (!input) return;
-        input.value = button.dataset.prompt || "";
-        input.focus();
-        input.dispatchEvent(new Event("input", { bubbles: true }));
-      });
-    });
-
-    const actionList = document.getElementById("actionList");
-    if (actionList) {
-      actionList.addEventListener("change", e => {
-        const box = e.target;
-        if (!box.matches?.("[data-action-index]")) return;
-        const actions = readActions(groupId, group);
-        const index = Number(box.dataset.actionIndex);
-        if (actions[index]) {
-          actions[index].done = box.checked;
-          localStorage.setItem(actionStorageKey(groupId), JSON.stringify(actions));
-        }
-      });
-    }
 
     const weeklyForm = document.getElementById("weeklyForm");
     if (weeklyForm) {
@@ -1875,6 +1831,8 @@ async function pageGroup(groupId) {
       const textarea = document.getElementById("messageInput");
       const sendBtn = document.getElementById("sendBtn");
       const charCount = document.getElementById("charCount");
+      const attachBtn = document.getElementById("attachBtn");
+      const fileInput = document.getElementById("fileInput");
       const syncComposer = () => {
         const value = textarea.value;
         textarea.style.height = "auto";
@@ -1887,29 +1845,102 @@ async function pageGroup(groupId) {
         const content = String(new FormData(form).get("content") || "").trim();
         if (!content) return;
         const previous = textarea.value;
+        const optimisticId = `local-${Date.now()}`;
+        const scroll = document.getElementById("chatScroll");
         textarea.value = "";
         syncComposer();
         if (sendBtn) {
           sendBtn.disabled = true;
           sendBtn.textContent = "发送中";
         }
+        if (scroll) {
+          const optimisticMessage = {
+            id: optimisticId,
+            user_id: user.id,
+            content,
+            created_at: new Date().toISOString(),
+            profiles: { display_name: profile?.display_name || "我" }
+          };
+          if (scroll.querySelector(".empty")) scroll.innerHTML = "";
+          scroll.insertAdjacentHTML("beforeend", renderChatBubble(optimisticMessage));
+          scroll.scrollTop = scroll.scrollHeight;
+        }
         const { error: sendError } = await db.from("messages").insert({ group_id: groupId, user_id: user.id, content });
         if (sendError) {
           textarea.value = previous;
           syncComposer();
           if (sendBtn) sendBtn.textContent = "发送";
+          await refreshMessageStream(true);
           alert(sendError.message);
         }
         else {
           form.reset();
           syncComposer();
-          await paint(true);
+          if (sendBtn) sendBtn.textContent = "发送";
+          await refreshMessageStream(true);
         }
+      };
+      const sendAttachment = async file => {
+        if (!file) return;
+        if (file.size > 10 * 1024 * 1024) {
+          alert("单个文件最多 10MB。");
+          return;
+        }
+        const safeName = file.name.replace(/[^\w.\-\u4e00-\u9fa5]+/g, "_").slice(0, 120) || "upload";
+        const mediaPath = `${groupId}/${user.id}/${Date.now()}-${safeName}`;
+        const messageType = file.type.startsWith("image/") ? "image" : "file";
+        const previousText = attachBtn?.getAttribute("aria-label") || "上传图片或文件";
+        if (attachBtn) {
+          attachBtn.disabled = true;
+          attachBtn.setAttribute("aria-label", "上传中");
+        }
+        const { error: uploadError } = await db.storage.from("chat-media").upload(mediaPath, file, {
+          cacheControl: "3600",
+          upsert: false,
+          contentType: file.type || "application/octet-stream"
+        });
+        if (uploadError) {
+          const needsSql = /bucket|not found|row-level security|policy/i.test(uploadError.message || "");
+          alert(needsSql ? "还需要在 Supabase 里重新运行 supabase/schema.sql，才能启用图片和文件上传。" : uploadError.message);
+          if (attachBtn) {
+            attachBtn.disabled = false;
+            attachBtn.setAttribute("aria-label", previousText);
+          }
+          return;
+        }
+        const { error: messageError } = await db.from("messages").insert({
+          group_id: groupId,
+          user_id: user.id,
+          content: file.name.slice(0, 500),
+          message_type: messageType,
+          media_path: mediaPath,
+          media_name: file.name,
+          media_mime: file.type || "application/octet-stream",
+          media_size: file.size
+        });
+        if (attachBtn) {
+          attachBtn.disabled = false;
+          attachBtn.setAttribute("aria-label", previousText);
+        }
+        if (messageError) {
+          const needsSql = /message_type|media_|column/i.test(messageError.message || "");
+          alert(needsSql ? "还需要在 Supabase 里重新运行 supabase/schema.sql，才能启用图片和文件上传。" : messageError.message);
+          return;
+        }
+        await refreshMessageStream(true);
       };
       form.addEventListener("submit", async e => {
         e.preventDefault();
         await send();
       });
+      if (attachBtn && fileInput) {
+        attachBtn.addEventListener("click", () => fileInput.click());
+        fileInput.addEventListener("change", async () => {
+          const file = fileInput.files?.[0];
+          fileInput.value = "";
+          await sendAttachment(file);
+        });
+      }
       textarea.addEventListener("input", syncComposer);
       textarea.addEventListener("keydown", async e => {
         if (e.key === "Enter" && !e.shiftKey) {
@@ -1922,7 +1953,47 @@ async function pageGroup(groupId) {
   }
 
   await paint(true);
-  refreshTimer = setInterval(() => paint(false), 6000);
+  refreshTimer = setInterval(async () => {
+    try {
+      if (routePath() !== `/group/${groupId}`) return;
+      passiveRefreshes += 1;
+      if (passiveRefreshes % 5 === 0) {
+        await paint(false);
+        return;
+      }
+      if (document.activeElement?.matches?.("#messageInput, #weeklyForm input, #weeklyForm textarea")) return;
+      const currentScroll = document.getElementById("chatScroll");
+      if (currentScroll) {
+        const distanceFromBottom = currentScroll.scrollHeight - currentScroll.scrollTop - currentScroll.clientHeight;
+        if (distanceFromBottom > 120) return;
+      }
+      await refreshMessageStream(true);
+    } catch (error) {
+      console.warn("message refresh failed", error);
+    }
+  }, 6000);
+}
+
+function bindReadyUnlockButton() {
+  const button = document.getElementById("unlockReadyBtn");
+  if (!button) return;
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    button.textContent = "解锁中";
+    const { error } = await db.rpc("unlock_ready_stage");
+    if (error) {
+      button.disabled = false;
+      button.textContent = "解锁 Ready";
+      const needsSql = /function .*unlock_ready_stage|Could not find the function/i.test(error.message);
+      alert(needsSql ? "还需要在 Supabase 里重新运行 supabase/schema.sql，才能启用 Ready 解锁。" : error.message);
+      return;
+    }
+    profile = null;
+    await ensureProfile();
+    await syncActiveChatCircle();
+    go("/home");
+    pageHome();
+  });
 }
 
 function bindInviteButtons() {

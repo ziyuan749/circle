@@ -79,6 +79,12 @@ create table if not exists public.messages (
   group_id uuid not null references public.groups(id) on delete cascade,
   user_id uuid not null references public.profiles(id) on delete cascade,
   content text not null check (char_length(content) between 1 and 5000),
+  message_type text not null default 'text' check (message_type in ('text', 'image', 'file')),
+  media_url text,
+  media_path text,
+  media_name text,
+  media_mime text,
+  media_size int,
   created_at timestamptz not null default now()
 );
 
@@ -130,6 +136,13 @@ alter table public.profiles add column if not exists target_role text default 'I
 alter table public.profiles add column if not exists application_progress text default '材料准备中';
 alter table public.profiles add column if not exists intensity text default '正常推进';
 
+alter table public.messages add column if not exists message_type text not null default 'text' check (message_type in ('text', 'image', 'file'));
+alter table public.messages add column if not exists media_url text;
+alter table public.messages add column if not exists media_path text;
+alter table public.messages add column if not exists media_name text;
+alter table public.messages add column if not exists media_mime text;
+alter table public.messages add column if not exists media_size int;
+
 alter table public.task_submissions add column if not exists task_id uuid references public.tasks(id) on delete cascade;
 alter table public.task_submissions add column if not exists group_id uuid references public.groups(id) on delete cascade;
 alter table public.task_submissions add column if not exists submitted_by uuid references public.profiles(id) on delete cascade;
@@ -169,6 +182,19 @@ create unique index if not exists idx_submissions_unique_group on public.task_su
 create unique index if not exists idx_invites_unique_pending on public.promotion_invites(inviter_id, invitee_id, target_level, status);
 create index if not exists idx_endorsements_target_created on public.profile_endorsements(target_id, created_at desc);
 create unique index if not exists idx_endorsements_unique_tag on public.profile_endorsements(endorser_id, target_id, tag);
+
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values (
+  'chat-media',
+  'chat-media',
+  false,
+  10485760,
+  null
+)
+on conflict (id) do update set
+  public = false,
+  file_size_limit = excluded.file_size_limit,
+  allowed_mime_types = null;
 
 -- Helper functions. security definer avoids RLS infinite recursion.
 create or replace function public.my_level()
@@ -231,6 +257,22 @@ as $$
     and g.status in ('forming', 'active', 'full');
 $$;
 
+create or replace function public.stage_label(p_level int)
+returns text
+language sql
+immutable
+set search_path = public
+as $$
+  select case coalesce(p_level, 1)
+    when 1 then 'Starter'
+    when 2 then 'Ready'
+    when 3 then 'Competitive'
+    when 4 then 'Peer Lead'
+    when 5 then 'Mentor'
+    else 'Starter'
+  end;
+$$;
+
 create or replace function public.group_active_member_count(p_group_id uuid)
 returns int
 language sql
@@ -273,7 +315,7 @@ begin
 
   select public.my_level() into v_user_level;
   if v_task.level <> v_user_level then
-    raise exception '这个任务是 L% 任务，你当前是 L%，只能加入同层级任务', v_task.level, v_user_level;
+    raise exception '这个任务属于 % 阶段，你当前是 %，只能加入同阶段任务', public.stage_label(v_task.level), public.stage_label(v_user_level);
   end if;
 
   -- Already in a circle for this task and level.
@@ -317,7 +359,7 @@ begin
     insert into public.groups (task_id, name, circle_type, topic, level, max_members, status)
     values (
       p_task_id,
-      v_task.title || ' L' || v_task.level || ' Circle ' || v_suffix,
+      v_task.title || ' · ' || public.stage_label(v_task.level) || ' Circle ' || v_suffix,
       'task',
       v_task.title,
       v_task.level,
@@ -361,7 +403,7 @@ begin
 
   v_level := coalesce(p_level, public.my_level());
   if v_level <> public.my_level() then
-    raise exception '你只能加入自己当前层级的聊天 Circle';
+    raise exception '你只能加入自己当前阶段的聊天 Circle';
   end if;
 
   -- Only one active exploration circle at a time, across all levels.
@@ -396,7 +438,7 @@ begin
       and level = v_level;
 
     insert into public.groups (name, circle_type, topic, level, max_members, status)
-    values (p_topic || ' L' || v_level || ' Circle ' || v_suffix, 'exploration', p_topic, v_level, 6, 'active')
+    values (p_topic || ' · ' || public.stage_label(v_level) || ' Circle ' || v_suffix, 'exploration', p_topic, v_level, 6, 'active')
     returning id into v_group_id;
   end if;
 
@@ -411,6 +453,113 @@ begin
   end if;
 
   return v_group_id;
+end;
+$$;
+
+create or replace function public.unlock_ready_stage()
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_user_id uuid := auth.uid();
+  v_profile public.profiles%rowtype;
+  v_week_start timestamptz := date_trunc('week', now());
+  v_sync_weeks int := 0;
+  v_current_syncs int := 0;
+  v_max_apps int := 0;
+  v_max_networking int := 0;
+begin
+  if v_user_id is null then
+    raise exception 'Not authenticated';
+  end if;
+
+  select * into v_profile
+  from public.profiles
+  where id = v_user_id;
+
+  if not found then
+    raise exception 'Profile not found';
+  end if;
+
+  if coalesce(v_profile.application_track, '') <> 'Summer Internship' then
+    raise exception 'Ready 解锁只用于 Summer Internship，Spring Week 暂时不需要细分阶段';
+  end if;
+
+  if coalesce(v_profile.level, 1) <> 1 then
+    raise exception '你当前已经不是 Starter';
+  end if;
+
+  if public.active_circle_count(v_user_id, 'exploration') < 1 then
+    raise exception '先加入一个长期聊天 Circle，再解锁 Ready';
+  end if;
+
+  if coalesce(v_profile.target_region, '') = ''
+    or coalesce(v_profile.target_role, '') = ''
+    or coalesce(v_profile.application_progress, '') = ''
+    or coalesce(v_profile.intensity, '') = '' then
+    raise exception '请先补全申请画像';
+  end if;
+
+  select count(distinct date_trunc('week', m.created_at))::int
+  into v_sync_weeks
+  from public.messages m
+  join public.groups g on g.id = m.group_id
+  join public.group_members gm on gm.group_id = g.id
+    and gm.user_id = v_user_id
+    and gm.status = 'active'
+  where m.user_id = v_user_id
+    and g.circle_type = 'exploration'
+    and m.content like '%【周同步】%'
+    and m.created_at >= now() - interval '28 days';
+
+  select
+    count(*)::int,
+    coalesce(max(coalesce(nullif(substring(m.content from '申请[:：][[:space:]]*([0-9]+)'), ''), '0')::int), 0),
+    coalesce(max(coalesce(nullif(substring(m.content from 'Networking[:：][[:space:]]*([0-9]+)'), ''), '0')::int), 0)
+  into v_current_syncs, v_max_apps, v_max_networking
+  from public.messages m
+  join public.groups g on g.id = m.group_id
+  join public.group_members gm on gm.group_id = g.id
+    and gm.user_id = v_user_id
+    and gm.status = 'active'
+  where m.user_id = v_user_id
+    and g.circle_type = 'exploration'
+    and m.content like '%【周同步】%'
+    and m.created_at >= v_week_start;
+
+  if v_current_syncs < 1 then
+    raise exception '本周完成一次周同步后才能解锁 Ready';
+  end if;
+
+  if v_sync_weeks < 2 and v_max_apps < 5 and v_max_networking < 3 then
+    raise exception '需要连续两周同步，或本周达到 5 个申请 / 3 次 networking 后解锁 Ready';
+  end if;
+
+  update public.profiles
+  set level = 2,
+      updated_at = now()
+  where id = v_user_id
+    and level = 1;
+
+  update public.group_members gm
+  set status = 'left',
+      left_at = now()
+  from public.groups g
+  where g.id = gm.group_id
+    and gm.user_id = v_user_id
+    and gm.status = 'active'
+    and g.circle_type = 'exploration'
+    and g.level < 2;
+
+  update public.groups g
+  set status = 'active'
+  where g.circle_type = 'exploration'
+    and g.status = 'full'
+    and public.group_active_member_count(g.id) < g.max_members;
+
+  return true;
 end;
 $$;
 
@@ -482,7 +631,7 @@ begin
   end if;
 
   if v_level <> public.my_level() then
-    raise exception '只能提交自己当前层级的任务';
+    raise exception '只能提交自己当前阶段的任务';
   end if;
 
   insert into public.task_submissions (task_id, group_id, submitted_by, title, submission_url, content, score)
@@ -528,11 +677,11 @@ begin
   end if;
 
   if v_inviter_level <= v_invitee_level then
-    raise exception '只有更高层级用户可以邀请低层用户升级';
+    raise exception '只有更高阶段用户可以邀请候选人升级';
   end if;
 
   if v_invitee_level >= 5 then
-    raise exception '对方已经在最高层级';
+    raise exception '对方已经在最高阶段';
   end if;
 
   if not public.can_view_group(p_group_id, v_inviter_id) then
@@ -599,6 +748,22 @@ begin
     set level = greatest(level, v_invite.target_level),
         updated_at = now()
     where id = v_user_id;
+
+    update public.group_members gm
+    set status = 'left',
+        left_at = now()
+    from public.groups g
+    where g.id = gm.group_id
+      and gm.user_id = v_user_id
+      and gm.status = 'active'
+      and g.circle_type = 'exploration'
+      and g.level < v_invite.target_level;
+
+    update public.groups g
+    set status = 'active'
+    where g.circle_type = 'exploration'
+      and g.status = 'full'
+      and public.group_active_member_count(g.id) < g.max_members;
   end if;
 end;
 $$;
@@ -635,7 +800,7 @@ begin
   end if;
 
   if v_endorser_level <= v_target_level then
-    raise exception '只有更高层级用户可以给 junior 添加推荐标签';
+    raise exception '只有更高阶段用户可以给候选人添加推荐标签';
   end if;
 
   insert into public.profile_endorsements (endorser_id, target_id, tag, note)
@@ -657,6 +822,9 @@ alter table public.messages enable row level security;
 alter table public.task_submissions enable row level security;
 alter table public.promotion_invites enable row level security;
 alter table public.profile_endorsements enable row level security;
+
+drop policy if exists "chat_media_select_visible" on storage.objects;
+drop policy if exists "chat_media_insert_members" on storage.objects;
 
 create policy "profiles_select_authenticated"
 on public.profiles for select
@@ -704,6 +872,22 @@ to authenticated
 with check (
   user_id = auth.uid()
   and public.is_group_member(messages.group_id, auth.uid())
+);
+
+create policy "chat_media_select_visible"
+on storage.objects for select
+to authenticated
+using (
+  bucket_id = 'chat-media'
+  and public.can_view_group((storage.foldername(name))[1]::uuid, auth.uid())
+);
+
+create policy "chat_media_insert_members"
+on storage.objects for insert
+to authenticated
+with check (
+  bucket_id = 'chat-media'
+  and public.is_group_member((storage.foldername(name))[1]::uuid, auth.uid())
 );
 
 create policy "submissions_select_visible"
@@ -1162,3 +1346,19 @@ from (
 ) member_levels
 where g.id = member_levels.group_id
   and g.circle_type = 'exploration';
+
+update public.groups
+set name = replace(
+  replace(
+    replace(
+      replace(
+        replace(name, ' L1 Circle', ' · Starter Circle'),
+        ' L2 Circle', ' · Ready Circle'
+      ),
+      ' L3 Circle', ' · Competitive Circle'
+    ),
+    ' L4 Circle', ' · Peer Lead Circle'
+  ),
+  ' L5 Circle', ' · Mentor Circle'
+)
+where name ~ ' L[1-5] Circle';
