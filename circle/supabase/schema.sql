@@ -13,7 +13,7 @@ begin
     select schemaname, tablename, policyname
     from pg_policies
     where schemaname = 'public'
-      and tablename in ('profiles', 'tasks', 'groups', 'group_members', 'messages', 'task_submissions', 'promotion_invites')
+      and tablename in ('profiles', 'tasks', 'groups', 'group_members', 'messages', 'task_submissions', 'promotion_invites', 'profile_endorsements')
   loop
     execute format('drop policy if exists %I on %I.%I', pol.policyname, pol.schemaname, pol.tablename);
   end loop;
@@ -25,6 +25,11 @@ create table if not exists public.profiles (
   display_name text,
   stage text default '未设置阶段',
   direction text default '未设置方向',
+  application_track text default 'Spring Week',
+  target_region text default '英国',
+  target_role text default 'Investment Banking',
+  application_progress text default '材料准备中',
+  intensity text default '正常推进',
   bio text default '',
   level int not null default 1,
   created_at timestamptz not null default now(),
@@ -104,10 +109,26 @@ create table if not exists public.promotion_invites (
   unique(inviter_id, invitee_id, target_level, status)
 );
 
+create table if not exists public.profile_endorsements (
+  id uuid primary key default gen_random_uuid(),
+  endorser_id uuid not null references public.profiles(id) on delete cascade,
+  target_id uuid not null references public.profiles(id) on delete cascade,
+  tag text not null check (char_length(tag) between 2 and 40),
+  note text default '' check (char_length(note) <= 1000),
+  created_at timestamptz not null default now(),
+  unique(endorser_id, target_id, tag)
+);
+
 alter table public.tasks add column if not exists level int not null default 1 check (level between 1 and 5);
 alter table public.tasks add column if not exists deliverable text not null default '提交一段小组结论、关键假设和下一步行动。';
 alter table public.tasks add column if not exists format_guide text not null default '建议格式：1. 结论摘要；2. 关键假设；3. 分析过程；4. 风险和下一步。提交链接可以是 Google Doc、Notion、PDF、Slides 或其他可访问材料。';
 alter table public.tasks add column if not exists score_max int not null default 100 check (score_max between 1 and 1000);
+
+alter table public.profiles add column if not exists application_track text default 'Spring Week';
+alter table public.profiles add column if not exists target_region text default '英国';
+alter table public.profiles add column if not exists target_role text default 'Investment Banking';
+alter table public.profiles add column if not exists application_progress text default '材料准备中';
+alter table public.profiles add column if not exists intensity text default '正常推进';
 
 alter table public.task_submissions add column if not exists task_id uuid references public.tasks(id) on delete cascade;
 alter table public.task_submissions add column if not exists group_id uuid references public.groups(id) on delete cascade;
@@ -128,6 +149,12 @@ alter table public.promotion_invites add column if not exists status text not nu
 alter table public.promotion_invites add column if not exists created_at timestamptz not null default now();
 alter table public.promotion_invites add column if not exists resolved_at timestamptz;
 
+alter table public.profile_endorsements add column if not exists endorser_id uuid references public.profiles(id) on delete cascade;
+alter table public.profile_endorsements add column if not exists target_id uuid references public.profiles(id) on delete cascade;
+alter table public.profile_endorsements add column if not exists tag text;
+alter table public.profile_endorsements add column if not exists note text default '';
+alter table public.profile_endorsements add column if not exists created_at timestamptz not null default now();
+
 create index if not exists idx_groups_task_id on public.groups(task_id);
 create index if not exists idx_groups_type_status on public.groups(circle_type, status);
 create index if not exists idx_group_members_user_status on public.group_members(user_id, status);
@@ -140,6 +167,8 @@ create index if not exists idx_submissions_user_created on public.task_submissio
 create index if not exists idx_invites_invitee_status on public.promotion_invites(invitee_id, status, created_at desc);
 create unique index if not exists idx_submissions_unique_group on public.task_submissions(group_id);
 create unique index if not exists idx_invites_unique_pending on public.promotion_invites(inviter_id, invitee_id, target_level, status);
+create index if not exists idx_endorsements_target_created on public.profile_endorsements(target_id, created_at desc);
+create unique index if not exists idx_endorsements_unique_tag on public.profile_endorsements(endorser_id, target_id, tag);
 
 -- Helper functions. security definer avoids RLS infinite recursion.
 create or replace function public.my_level()
@@ -574,6 +603,51 @@ begin
 end;
 $$;
 
+create or replace function public.endorse_profile(
+  p_target_id uuid,
+  p_tag text,
+  p_note text default ''
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_endorser_id uuid := auth.uid();
+  v_endorser_level int;
+  v_target_level int;
+  v_endorsement_id uuid;
+begin
+  if v_endorser_id is null then
+    raise exception 'Not authenticated';
+  end if;
+
+  if v_endorser_id = p_target_id then
+    raise exception '不能给自己添加推荐标签';
+  end if;
+
+  select level into v_endorser_level from public.profiles where id = v_endorser_id;
+  select level into v_target_level from public.profiles where id = p_target_id;
+
+  if v_target_level is null then
+    raise exception 'Target profile not found';
+  end if;
+
+  if v_endorser_level <= v_target_level then
+    raise exception '只有更高层级用户可以给 junior 添加推荐标签';
+  end if;
+
+  insert into public.profile_endorsements (endorser_id, target_id, tag, note)
+  values (v_endorser_id, p_target_id, trim(p_tag), coalesce(trim(p_note), ''))
+  on conflict (endorser_id, target_id, tag)
+  do update set note = excluded.note, created_at = now()
+  returning id into v_endorsement_id;
+
+  return v_endorsement_id;
+end;
+$$;
+
 -- RLS
 alter table public.profiles enable row level security;
 alter table public.tasks enable row level security;
@@ -582,6 +656,7 @@ alter table public.group_members enable row level security;
 alter table public.messages enable row level security;
 alter table public.task_submissions enable row level security;
 alter table public.promotion_invites enable row level security;
+alter table public.profile_endorsements enable row level security;
 
 create policy "profiles_select_authenticated"
 on public.profiles for select
@@ -602,13 +677,14 @@ with check (id = auth.uid());
 create policy "tasks_select_open"
 on public.tasks for select
 to authenticated
-using (status in ('open', 'closed', 'archived') and level <= public.my_level());
+using (status in ('open', 'closed', 'archived'));
 
 create policy "groups_select_visible"
 on public.groups for select
 to authenticated
 using (
-  level <= public.my_level()
+  circle_type = 'task'
+  or level <= public.my_level()
   or public.is_group_member(groups.id, auth.uid())
 );
 
@@ -633,7 +709,7 @@ with check (
 create policy "submissions_select_visible"
 on public.task_submissions for select
 to authenticated
-using (public.can_view_group(task_submissions.group_id, auth.uid()));
+using (true);
 
 create policy "submissions_insert_members"
 on public.task_submissions for insert
@@ -657,6 +733,11 @@ using (
   or invitee_id = auth.uid()
   or public.can_view_group(promotion_invites.group_id, auth.uid())
 );
+
+create policy "endorsements_select_authenticated"
+on public.profile_endorsements for select
+to authenticated
+using (true);
 
 -- Seed tasks. This is idempotent by title.
 insert into public.tasks (title, description, category, level, deliverable, score_max, group_size, duration_days, status)
@@ -728,6 +809,127 @@ select * from (values
     'open'
   ),
   (
+    '改写一份 Spring Week 简历 bullet',
+    '请每位成员提供 2-3 条经历 bullet，小组互相修改，重点提升动词、量化结果和求职方向匹配度。',
+    '申请材料',
+    1,
+    '提交一份 before/after 简历 bullet 对照，说明修改逻辑和最终版本。',
+    100,
+    4,
+    3,
+    'open'
+  ),
+  (
+    '制定一周海外实习申请冲刺计划',
+    '请每位成员列出目标地区、目标岗位、本周申请数量、networking 数量和需要补的能力，小组互相检查是否现实。',
+    '求职策略',
+    1,
+    '提交一份一周申请冲刺计划，包含岗位清单、每日行动、networking 目标和复盘方式。',
+    100,
+    4,
+    3,
+    'open'
+  ),
+  (
+    '整理一份校友 networking 地图',
+    '请围绕目标地区和目标岗位，整理校友、学长学姐、社团和公司员工触达名单，并设计第一封消息。',
+    '求职策略',
+    2,
+    '提交一份 networking 地图，包含目标人群分层、触达优先级、私信模板和跟进节奏。',
+    100,
+    5,
+    5,
+    'open'
+  ),
+  (
+    '比较英国、香港、美国金融申请路径',
+    '请比较三个地区在招聘时间线、签证/身份、target school、networking、面试和岗位数量上的差异。',
+    '求职策略',
+    3,
+    '提交一份地区申请策略 memo，包含英港美路径对比、个人适配判断和未来 30 天行动。',
+    100,
+    6,
+    7,
+    'open'
+  ),
+  (
+    '模拟 HireVue：讲一个 leadership 故事',
+    '请用 STAR 框架准备一个 leadership 故事，小组互相追问并打磨到 90 秒以内。',
+    '投行面试',
+    1,
+    '提交一份 90 秒 behavioral answer，包含 STAR 结构和可能追问。',
+    100,
+    4,
+    3,
+    'open'
+  ),
+  (
+    'Spring Week 申请 tracker 搭建',
+    '请整理目标银行、岗位、截止日期、申请状态、HireVue 状态和复盘字段，小组互相检查是否覆盖完整。',
+    'Spring Week',
+    1,
+    '提交一份 Spring Week tracker 模板，包含目标公司、截止日期、当前状态、下一步动作和复盘字段。',
+    100,
+    4,
+    3,
+    'open'
+  ),
+  (
+    'Spring Week HireVue 高频题训练',
+    '请每位成员选择 2 道 behavioral 高频题，用 90 秒回答并让小组追问。',
+    'Spring Week',
+    1,
+    '提交一份 HireVue 回答包，包含 2 个 STAR 故事、90 秒版本和小组反馈。',
+    100,
+    4,
+    3,
+    'open'
+  ),
+  (
+    'Summer IB technical 第一轮自测',
+    '请围绕 accounting、valuation、DCF 和 M&A 各整理 3 道问题，小组互相模拟第一轮面试。',
+    'Summer 投行',
+    2,
+    '提交一份 technical 自测记录，包含至少 12 道题、回答框架、错题和下一步复习计划。',
+    100,
+    5,
+    5,
+    'open'
+  ),
+  (
+    'Summer Consulting case partner 训练',
+    '请两两配对完成一个 profitability 或 market entry case，并记录结构、假设、计算和反馈。',
+    'Summer 咨询',
+    2,
+    '提交一份 case 训练复盘，包含题目、结构图、关键计算、反馈和下一次训练目标。',
+    100,
+    5,
+    5,
+    'open'
+  ),
+  (
+    'Summer referral 冲刺计划',
+    '请围绕目标公司列出 20 个可触达人选，设计首封消息、跟进节奏和 referral 转化记录方式。',
+    'Summer Networking',
+    3,
+    '提交一份 referral 冲刺计划，包含目标名单、触达模板、跟进节奏、记录字段和一周目标。',
+    100,
+    6,
+    7,
+    'open'
+  ),
+  (
+    '拆解一个你喜欢的消费品牌',
+    '请选择一个消费品牌，从用户、产品、渠道、定价和增长方式拆解它为什么成立。',
+    '商业分析',
+    1,
+    '提交一份品牌拆解 memo，包含用户画像、产品定位、渠道和增长逻辑。',
+    100,
+    4,
+    4,
+    'open'
+  ),
+  (
     '设计一个投行申请者的 networking 系统',
     '请围绕目标名单、触达话术、跟进节奏、信息记录和 referral 转化设计一个可执行系统。',
     '求职策略',
@@ -739,11 +941,154 @@ select * from (values
     'open'
   ),
   (
+    '为一家 SaaS 公司设计中小企业获客方案',
+    '假设产品面向中小企业财务团队，请设计目标客群、渠道组合、销售漏斗、定价实验和前三个月执行计划。',
+    '产品增长',
+    4,
+    '提交一份 GTM 方案，包含 ICP、渠道、销售漏斗、定价假设和 90 天实验。',
+    100,
+    6,
+    7,
+    'open'
+  ),
+  (
+    '写一份半导体行业三页 pitch deck',
+    '请选择半导体产业链中的一个细分方向，整理行业结构、关键公司、核心驱动和投资机会。',
+    '股票分析',
+    4,
+    '提交一份三页 pitch deck，包含行业地图、核心驱动、推荐标的和风险。',
+    100,
+    6,
+    7,
+    'open'
+  ),
+  (
     '评估一个求职社交产品的增长飞轮',
     '请从用户分层、留存、内容供给、任务激励、邀请机制和商业化角度评估 circle 类产品。',
     '产品战略',
     5,
     '提交一份产品战略 memo，包含核心飞轮、关键风险、北极星指标和 90 天实验计划。',
+    100,
+    6,
+    7,
+    'open'
+  ),
+  (
+    '设计一个 AI 面试教练的商业化路径',
+    '假设你负责一个 AI 面试教练产品，请设计从免费工具到付费订阅的转化路径和定价策略。',
+    'AI 产品 / 创业',
+    5,
+    '提交一份商业化方案，包含用户分层、付费触发点、定价、留存和关键指标。',
+    100,
+    6,
+    7,
+    'open'
+  ),
+  (
+    '评估一家上市公司的资本配置质量',
+    '请选择一家公司，分析它过去五年的资本开支、回购、并购、分红和 ROIC 变化。',
+    '股票分析',
+    5,
+    '提交一份资本配置 memo，包含历史行为、管理层判断、ROIC 变化和投资结论。',
+    100,
+    6,
+    7,
+    'open'
+  ),
+  (
+    '设计一个校内求职社群的冷启动计划',
+    '假设你要在一所大学启动 circle，请设计种子用户、首批 Circle、任务机制、邀请路径和留存动作。',
+    '社区增长',
+    5,
+    '提交一份校园冷启动计划，包含种子用户、首批任务、邀请机制和 30 天增长节奏。',
+    100,
+    6,
+    7,
+    'open'
+  ),
+  (
+    '为一家精品咖啡连锁设计门店扩张模型',
+    '请围绕选址、单店模型、客单价、复购、人员成本和现金回收期搭建扩张判断框架。',
+    '咨询实践',
+    2,
+    '提交一份门店扩张模型框架，包含关键假设、单店经济性和扩张节奏建议。',
+    100,
+    5,
+    5,
+    'open'
+  ),
+  (
+    '给一家 AI 求职工具做竞品分析',
+    '请选择 3 个竞品，从目标用户、核心功能、定价、获客渠道和差异化切入点分析。',
+    'AI 产品 / 创业',
+    2,
+    '提交一份竞品分析，包含竞品矩阵、差异化机会和 MVP 功能建议。',
+    100,
+    5,
+    5,
+    'open'
+  ),
+  (
+    '搭建一个投行 technical 面试题库',
+    '请整理估值、会计、并购、杠杆收购四类常见问题，并给出简洁回答框架。',
+    '投行面试',
+    2,
+    '提交一份 technical 题库，包含至少 12 个问题、回答框架和常见追问。',
+    100,
+    5,
+    5,
+    'open'
+  ),
+  (
+    '写一份消费公司 one-page stock pitch',
+    '选择一家消费公司，用一页纸说明投资观点、增长驱动、估值、风险和催化剂。',
+    '股票分析',
+    2,
+    '提交一页 stock pitch，包含观点、驱动、估值、风险和催化剂。',
+    100,
+    5,
+    5,
+    'open'
+  ),
+  (
+    '分析一家奢侈品公司的中国增长风险',
+    '请围绕宏观消费、品牌势能、渠道、价格带和竞争格局分析一家奢侈品公司的中国风险。',
+    '股票分析',
+    3,
+    '提交一份风险分析 memo，包含核心风险、证据、反方观点和监测指标。',
+    100,
+    6,
+    7,
+    'open'
+  ),
+  (
+    '为一家跨境电商设计欧洲市场进入方案',
+    '请讨论目标国家、品类选择、物流、渠道、定价、合规和前三个月测试计划。',
+    '咨询实践',
+    3,
+    '提交一份欧洲市场进入方案，包含国家选择、渠道、物流、合规和测试计划。',
+    100,
+    6,
+    7,
+    'open'
+  ),
+  (
+    '设计一个实习申请 tracker',
+    '请设计一个能让用户管理申请、networking、面试和复盘的 tracker 结构。',
+    '求职策略',
+    3,
+    '提交一份申请 tracker 模板，包含字段设计、使用流程和复盘机制。',
+    100,
+    6,
+    5,
+    'open'
+  ),
+  (
+    '模拟咨询项目：降低一家餐饮连锁的外卖亏损',
+    '请用咨询项目方式拆解外卖亏损来源，并提出能在 60 天内测试的改善方案。',
+    '咨询实践',
+    3,
+    '提交一份利润改善方案，包含问题树、关键假设、数据需求和 60 天实验。',
     100,
     6,
     7,
@@ -765,8 +1110,32 @@ from (values
   ('帮一家 AI 教育产品找到第一批用户', 2, '提交一份冷启动方案，包含首批用户画像、渠道、转化路径和留存机制。'),
   ('模拟投行面试：如何解释 DCF', 1, '提交一份面试回答框架，包含 60 秒版本、关键假设和常见追问。'),
   ('模拟咨询 Case：估算伦敦一年卖出多少杯咖啡', 1, '提交一份 market sizing 拆解，包含公式、核心假设和 sanity check。'),
+  ('改写一份 Spring Week 简历 bullet', 1, '提交一份 before/after 简历 bullet 对照，说明修改逻辑和最终版本。'),
+  ('制定一周海外实习申请冲刺计划', 1, '提交一份一周申请冲刺计划，包含岗位清单、每日行动、networking 目标和复盘方式。'),
+  ('Spring Week 申请 tracker 搭建', 1, '提交一份 Spring Week tracker 模板，包含目标公司、截止日期、当前状态、下一步动作和复盘字段。'),
+  ('Spring Week HireVue 高频题训练', 1, '提交一份 HireVue 回答包，包含 2 个 STAR 故事、90 秒版本和小组反馈。'),
+  ('整理一份校友 networking 地图', 2, '提交一份 networking 地图，包含目标人群分层、触达优先级、私信模板和跟进节奏。'),
+  ('Summer IB technical 第一轮自测', 2, '提交一份 technical 自测记录，包含至少 12 道题、回答框架、错题和下一步复习计划。'),
+  ('Summer Consulting case partner 训练', 2, '提交一份 case 训练复盘，包含题目、结构图、关键计算、反馈和下一次训练目标。'),
+  ('比较英国、香港、美国金融申请路径', 3, '提交一份地区申请策略 memo，包含英港美路径对比、个人适配判断和未来 30 天行动。'),
+  ('Summer referral 冲刺计划', 3, '提交一份 referral 冲刺计划，包含目标名单、触达模板、跟进节奏、记录字段和一周目标。'),
+  ('模拟 HireVue：讲一个 leadership 故事', 1, '提交一份 90 秒 behavioral answer，包含 STAR 结构和可能追问。'),
+  ('拆解一个你喜欢的消费品牌', 1, '提交一份品牌拆解 memo，包含用户画像、产品定位、渠道和增长逻辑。'),
+  ('为一家精品咖啡连锁设计门店扩张模型', 2, '提交一份门店扩张模型框架，包含关键假设、单店经济性和扩张节奏建议。'),
+  ('给一家 AI 求职工具做竞品分析', 2, '提交一份竞品分析，包含竞品矩阵、差异化机会和 MVP 功能建议。'),
+  ('搭建一个投行 technical 面试题库', 2, '提交一份 technical 题库，包含至少 12 个问题、回答框架和常见追问。'),
+  ('写一份消费公司 one-page stock pitch', 2, '提交一页 stock pitch，包含观点、驱动、估值、风险和催化剂。'),
+  ('分析一家奢侈品公司的中国增长风险', 3, '提交一份风险分析 memo，包含核心风险、证据、反方观点和监测指标。'),
+  ('为一家跨境电商设计欧洲市场进入方案', 3, '提交一份欧洲市场进入方案，包含国家选择、渠道、物流、合规和测试计划。'),
+  ('设计一个实习申请 tracker', 3, '提交一份申请 tracker 模板，包含字段设计、使用流程和复盘机制。'),
+  ('模拟咨询项目：降低一家餐饮连锁的外卖亏损', 3, '提交一份利润改善方案，包含问题树、关键假设、数据需求和 60 天实验。'),
   ('设计一个投行申请者的 networking 系统', 4, '提交一份 networking operating system，包含目标分层、触达模板、跟进节奏和转化指标。'),
-  ('评估一个求职社交产品的增长飞轮', 5, '提交一份产品战略 memo，包含核心飞轮、关键风险、北极星指标和 90 天实验计划。')
+  ('为一家 SaaS 公司设计中小企业获客方案', 4, '提交一份 GTM 方案，包含 ICP、渠道、销售漏斗、定价假设和 90 天实验。'),
+  ('写一份半导体行业三页 pitch deck', 4, '提交一份三页 pitch deck，包含行业地图、核心驱动、推荐标的和风险。'),
+  ('评估一个求职社交产品的增长飞轮', 5, '提交一份产品战略 memo，包含核心飞轮、关键风险、北极星指标和 90 天实验计划。'),
+  ('设计一个 AI 面试教练的商业化路径', 5, '提交一份商业化方案，包含用户分层、付费触发点、定价、留存和关键指标。'),
+  ('评估一家上市公司的资本配置质量', 5, '提交一份资本配置 memo，包含历史行为、管理层判断、ROIC 变化和投资结论。'),
+  ('设计一个校内求职社群的冷启动计划', 5, '提交一份校园冷启动计划，包含种子用户、首批任务、邀请机制和 30 天增长节奏。')
 ) as v(title, level, deliverable)
 where public.tasks.title = v.title;
 
