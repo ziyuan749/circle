@@ -10,9 +10,12 @@ let user = null;
 let profile = null;
 let activeChatCircle = null;
 let refreshTimer = null;
+let unreadRefreshTimer = null;
 let cleanupCurrentPage = null;
 let routeRenderToken = 0;
 let authStateVersion = 0;
+let unreadByGroup = new Map();
+let unreadByType = { exploration: 0, task: 0 };
 
 const stageLabels = {
   1: "Starter",
@@ -428,10 +431,28 @@ function notice(text, type = "") {
   return `<div class="notice ${type}">${h(text)}</div>`;
 }
 
-function nav(path, label) {
+function authErrorMessage(error) {
+  const message = String(error?.message || "操作失败，请稍后再试。");
+  if (/email rate limit exceeded/i.test(message)) return "注册邮件发送次数过多，请稍后再试。";
+  if (/user already registered/i.test(message)) return "这个邮箱已经注册，请直接登录。";
+  if (/password should be at least/i.test(message)) return "密码至少需要 6 位。";
+  if (/invalid login credentials/i.test(message)) return "邮箱或密码不正确。";
+  return message;
+}
+
+function unreadBadge(count, className = "") {
+  const value = Number(count || 0);
+  if (!value) return "";
+  return `<span class="unread-badge ${className}" aria-label="${value} 条未读消息">${value > 99 ? "99+" : value}</span>`;
+}
+
+function nav(path, label, unreadCount = 0, unreadType = "") {
   const current = routePath();
   const active = current === path || (path !== "/home" && current.startsWith(path));
-  return `<a class="nav-item ${active ? "active" : ""}" href="#${path}">${label}</a>`;
+  const badge = unreadType
+    ? `<span data-unread-type="${unreadType}" ${unreadCount ? "" : "hidden"}>${unreadBadge(unreadCount, "nav-unread")}</span>`
+    : unreadBadge(unreadCount, "nav-unread");
+  return `<a class="nav-item ${active ? "active" : ""}" href="#${path}">${label}${badge}</a>`;
 }
 
 function chatHomePath() {
@@ -453,6 +474,93 @@ async function myAdminFlag() {
   return Boolean(fallback.data?.is_admin);
 }
 
+function applyUnreadBadges() {
+  document.querySelectorAll("[data-unread-type]").forEach(element => {
+    const count = unreadByType[element.dataset.unreadType] || 0;
+    element.innerHTML = unreadBadge(count, "nav-unread");
+    element.hidden = !count;
+  });
+  document.querySelectorAll("[data-unread-group]").forEach(element => {
+    const count = unreadByGroup.get(element.dataset.unreadGroup)?.count || 0;
+    element.innerHTML = unreadBadge(count, "card-unread");
+    element.hidden = !count;
+  });
+}
+
+async function refreshUnreadCounts() {
+  if (!db || !user) return;
+  const { data, error } = await db.rpc("my_unread_group_counts");
+  if (error) {
+    if (!/my_unread_group_counts|schema cache|function/i.test(error.message || "")) {
+      console.warn("unread counts failed", error);
+    }
+    return;
+  }
+  unreadByGroup = new Map((data || []).map(item => [item.group_id, {
+    count: Number(item.unread_count || 0),
+    circleType: item.circle_type,
+    lastMessageAt: item.last_message_at
+  }]));
+  unreadByType = (data || []).reduce((totals, item) => {
+    const type = item.circle_type === "task" ? "task" : "exploration";
+    totals[type] += Number(item.unread_count || 0);
+    return totals;
+  }, { exploration: 0, task: 0 });
+  applyUnreadBadges();
+}
+
+function clearUnreadForGroup(groupId) {
+  const current = unreadByGroup.get(groupId);
+  if (!current) return;
+  const type = current.circleType === "task" ? "task" : "exploration";
+  unreadByType[type] = Math.max(0, Number(unreadByType[type] || 0) - Number(current.count || 0));
+  unreadByGroup.delete(groupId);
+  applyUnreadBadges();
+}
+
+async function groupReadBoundary(groupId) {
+  const { data: readState, error: readError } = await db
+    .from("group_read_states")
+    .select("last_read_at")
+    .eq("group_id", groupId)
+    .eq("user_id", user.id)
+    .maybeSingle();
+  if (!readError && readState?.last_read_at) return readState.last_read_at;
+
+  const { data: membership } = await db
+    .from("group_members")
+    .select("joined_at")
+    .eq("group_id", groupId)
+    .eq("user_id", user.id)
+    .eq("status", "active")
+    .maybeSingle();
+  return membership?.joined_at || null;
+}
+
+async function markGroupRead(groupId, readThrough) {
+  if (!groupId || !readThrough || document.visibilityState === "hidden") return;
+  const { error } = await db.rpc("mark_group_read", {
+    p_group_id: groupId,
+    p_read_through: readThrough
+  });
+  if (error) {
+    if (!/mark_group_read|schema cache|function/i.test(error.message || "")) {
+      console.warn("mark group read failed", error);
+    }
+    return;
+  }
+  clearUnreadForGroup(groupId);
+}
+
+function startUnreadPolling() {
+  if (unreadRefreshTimer) clearInterval(unreadRefreshTimer);
+  unreadRefreshTimer = null;
+  if (!user) return;
+  unreadRefreshTimer = setInterval(() => {
+    refreshUnreadCounts().catch(error => console.warn("unread refresh failed", error));
+  }, 45000);
+}
+
 function layout(content, options = {}) {
   const logged = Boolean(user);
   app.innerHTML = `
@@ -462,8 +570,8 @@ function layout(content, options = {}) {
           <a class="brand" href="#/home">circle</a>
           <nav class="main-nav">
             ${logged ? nav("/home", "今日") : ""}
-            ${logged ? `<a class="nav-item ${routePath().startsWith("/chat") || routePath().startsWith("/group") || routePath().startsWith("/observe") ? "active" : ""}" href="#/chat">聊天 Circle</a>` : ""}
-            ${logged ? nav("/tasks", "挑战") : ""}
+            ${logged ? `<a class="nav-item ${routePath().startsWith("/chat") || routePath().startsWith("/group") || routePath().startsWith("/observe") ? "active" : ""}" href="#/chat">聊天 Circle<span data-unread-type="exploration" ${unreadByType.exploration ? "" : "hidden"}>${unreadBadge(unreadByType.exploration, "nav-unread")}</span></a>` : ""}
+            ${logged ? nav("/tasks", "挑战", unreadByType.task, "task") : ""}
             ${logged ? nav("/showcase", "成果") : ""}
             ${logged ? nav("/profile", "主页") : ""}
             ${logged && canOperateAdmin() ? nav("/admin", "后台") : ""}
@@ -492,6 +600,7 @@ async function init() {
     if (user) {
       await ensureProfile();
       await syncActiveChatCircle();
+      startUnreadPolling();
     }
     db.auth.onAuthStateChange((_event, nextSession) => {
       const nextUser = nextSession?.user || null;
@@ -508,11 +617,14 @@ async function init() {
           user = nextUser;
           profile = null;
           activeChatCircle = null;
+          unreadByGroup = new Map();
+          unreadByType = { exploration: 0, task: 0 };
           if (user) {
             await ensureProfile();
             if (version !== authStateVersion) return;
             await syncActiveChatCircle();
           }
+          startUnreadPolling();
           if (version !== authStateVersion) return;
           await renderRoute();
         } catch (error) {
@@ -603,6 +715,62 @@ async function memberships() {
     .order("joined_at", { ascending: false });
   if (error) throw error;
   return (data || []).filter(row => ["forming", "active", "full"].includes(row.groups?.status));
+}
+
+async function pausedChatMembership() {
+  if (!user) return null;
+  const { data, error } = await db
+    .from("group_members")
+    .select("id, joined_at, paused_at, pause_reason, groups:group_id (id, name, topic, level, circle_type, max_members, status)")
+    .eq("user_id", user.id)
+    .eq("status", "paused")
+    .order("paused_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) {
+    if (!/paused_at|pause_reason|schema cache|column/i.test(error.message || "")) {
+      console.warn("paused membership failed", error);
+    }
+    return null;
+  }
+  return data?.groups?.circle_type === "exploration" ? data : null;
+}
+
+async function groupActiveMemberCount(groupId) {
+  if (!groupId) return 0;
+  const { count, error } = await db
+    .from("group_members")
+    .select("id", { count: "exact", head: true })
+    .eq("group_id", groupId)
+    .eq("status", "active");
+  return error ? 0 : Number(count || 0);
+}
+
+async function adminStarterMemberships() {
+  const { data, error } = await db.rpc("admin_starter_memberships");
+  return { rows: error ? [] : (data || []), error };
+}
+
+function bindReactivateChatButtons() {
+  document.querySelectorAll(".reactivateChat").forEach(button => {
+    button.addEventListener("click", async () => {
+      button.disabled = true;
+      button.textContent = "恢复中...";
+      const { data, error } = await db.rpc("reactivate_starter_seat", {
+        p_membership_id: button.dataset.membership
+      });
+      if (error) {
+        alert(/reactivate_starter_seat|schema cache|function/i.test(error.message || "")
+          ? "恢复席位功能还没有写入 Supabase，请先运行本次新增的 SQL。"
+          : error.message);
+        button.disabled = false;
+        button.textContent = "恢复匹配";
+        return;
+      }
+      await syncActiveChatCircle();
+      go(`/group/${data}`);
+    });
+  });
 }
 
 async function pendingInvites() {
@@ -859,6 +1027,7 @@ async function renderRoute() {
   }
   try {
     const path = routePath();
+    if (user && path !== "/login") await refreshUnreadCounts();
     if (path === "/" || path === "/home") return await pageHome(token);
     if (path === "/login") return await pageLogin(token);
     if (path === "/chat") return await pageChatLobby(token);
@@ -898,11 +1067,11 @@ async function pageLogin(token = routeRenderToken) {
       </div>
       <form class="panel form-card" id="loginForm">
         <h2>登录 circle</h2>
-        <label>邮箱<input name="email" type="email" required placeholder="you@example.com"></label>
-        <label>密码<input name="password" type="password" required placeholder="至少 6 位"></label>
+        <label>邮箱<input name="email" type="email" required autocomplete="email" placeholder="you@example.com"></label>
+        <label>密码<input name="password" type="password" required minlength="6" autocomplete="current-password" placeholder="至少 6 位"></label>
         <div class="button-row">
-          <button class="primary-btn" type="submit">登录</button>
-          <button class="secondary-btn" id="signupBtn" type="button">注册</button>
+          <button class="primary-btn" id="loginBtn" type="submit">登录</button>
+          <button class="secondary-btn" id="signupBtn" type="button">注册并进入</button>
         </div>
         <div id="loginMsg"></div>
       </form>
@@ -911,25 +1080,45 @@ async function pageLogin(token = routeRenderToken) {
 
   const form = document.getElementById("loginForm");
   const msg = document.getElementById("loginMsg");
+  const loginBtn = document.getElementById("loginBtn");
+  const signupBtn = document.getElementById("signupBtn");
   form.addEventListener("submit", async e => {
     e.preventDefault();
+    if (!form.reportValidity()) return;
     const fd = new FormData(form);
+    loginBtn.disabled = true;
+    signupBtn.disabled = true;
     msg.innerHTML = "登录中...";
     const { error } = await db.auth.signInWithPassword({
-      email: String(fd.get("email")),
+      email: String(fd.get("email")).trim(),
       password: String(fd.get("password"))
     });
-    if (error) msg.innerHTML = notice(error.message, "error");
+    loginBtn.disabled = false;
+    signupBtn.disabled = false;
+    if (error) msg.innerHTML = notice(authErrorMessage(error), "error");
     else msg.innerHTML = notice("登录成功，正在加载你的 Circle。", "success");
   });
-  document.getElementById("signupBtn").addEventListener("click", async () => {
+  signupBtn.addEventListener("click", async () => {
+    if (!form.reportValidity()) return;
     const fd = new FormData(form);
+    loginBtn.disabled = true;
+    signupBtn.disabled = true;
+    signupBtn.textContent = "注册中...";
     msg.innerHTML = "注册中...";
-    const { error } = await db.auth.signUp({
-      email: String(fd.get("email")),
+    const { data, error } = await db.auth.signUp({
+      email: String(fd.get("email")).trim(),
       password: String(fd.get("password"))
     });
-    msg.innerHTML = error ? notice(error.message, "error") : notice("注册成功。若开启邮箱确认，请先去邮箱确认。", "success");
+    loginBtn.disabled = false;
+    signupBtn.disabled = false;
+    signupBtn.textContent = "注册并进入";
+    if (error) {
+      msg.innerHTML = notice(authErrorMessage(error), "error");
+      return;
+    }
+    msg.innerHTML = data.session
+      ? notice("注册成功，正在进入 Circle。", "success")
+      : notice("账号已创建，请打开确认邮件后登录。", "success");
   });
 }
 
@@ -944,23 +1133,29 @@ async function logout() {
   user = null;
   profile = null;
   activeChatCircle = null;
+  unreadByGroup = new Map();
+  unreadByType = { exploration: 0, task: 0 };
+  startUnreadPolling();
   go("/login");
 }
 
 async function pageHome(token = routeRenderToken) {
   if (!(await requireUser())) return;
   await db.rpc("refresh_challenge_lifecycle");
-  const [mine, invites, subs, juniorCircles, submissionCount] = await Promise.all([
+  const [mine, invites, subs, juniorCircles, submissionCount, pausedChat] = await Promise.all([
     memberships(),
     pendingInvites(),
     mySubmissions(5),
     juniorChatCircles(),
-    profileSubmissionCount(user.id)
+    profileSubmissionCount(user.id),
+    pausedChatMembership()
   ]);
-  const chat = mine.find(m => m.groups?.circle_type === "exploration")?.groups;
+  const chatMembership = mine.find(m => m.groups?.circle_type === "exploration");
+  const chat = chatMembership?.groups;
   const taskCircles = mine.filter(m => m.groups?.circle_type === "task");
   const chatMessages = chat ? await recentGroupMessages(chat.id) : [];
   const storedUserCheckins = chat ? await weeklyCheckinsForUser(user.id) : null;
+  const chatMemberCount = chat ? await groupActiveMemberCount(chat.id) : 0;
   const checkins = chat
     ? (await weeklyCheckinsForGroup(chat.id) || weeklyCheckins(chatMessages))
     : [];
@@ -968,21 +1163,38 @@ async function pageHome(token = routeRenderToken) {
   const timeline = applicationTimeline(profile);
   const chatForming = chat?.status === "forming";
   let nextActions = suggestedActions(profile, myCheckin, subs);
-  if (!chat) {
+  if (pausedChat) {
     nextActions = [
-      "先加入一个目标相近的聊天 Circle，凑齐 3 人后再开始周同步。",
+      "你的 Starter 席位已暂停。恢复后会优先回到原小队；如果原小队已满，系统会重新匹配。",
+      ...nextActions.filter(item => !item.startsWith("先做本周同步"))
+    ];
+  } else if (!chat) {
+    nextActions = [
+      "先加入一个目标相近的聊天 Circle，加入后就可以聊天和同步进度。",
       ...nextActions.filter(item => !item.startsWith("先做本周同步"))
     ];
   } else if (chatForming) {
     nextActions = [
-      "聊天小队还在匹配成员。凑齐 3 人后会自动开放聊天和周同步。",
-      ...nextActions.filter(item => !item.startsWith("先做本周同步"))
+      "聊天小队还在匹配成员，但你现在已经可以聊天和同步进度；达到 3 人后会开放周榜。",
+      ...nextActions
     ];
   }
-  const readyUnlock = readyEligibility(profile, chatMessages, chat, storedUserCheckins);
+  const readyUnlock = readyEligibility(profile, chatMessages, chat, storedUserCheckins, chatMemberCount);
   const currentChatLevel = Number(chat?.level || 0);
   const availableChatLevel = chatCircleLevel(profile);
   const higherCircleAvailable = Boolean(chat && currentChatLevel < availableChatLevel);
+  const latestStarterSignal = Math.max(
+    new Date(chatMembership?.joined_at || 0).getTime(),
+    ...(storedUserCheckins || [])
+      .filter(item => item.groupId === chat?.id)
+      .map(item => new Date(item.createdAt || 0).getTime())
+  );
+  const starterSeatReminder = Boolean(
+    chat
+    && Number(profile.level || 1) === 1
+    && latestStarterSignal > 0
+    && Date.now() - latestStarterSignal >= 5 * 24 * 60 * 60 * 1000
+  );
   if (token !== routeRenderToken) return;
 
   layout(`
@@ -993,7 +1205,7 @@ async function pageHome(token = routeRenderToken) {
         <p>${h(profile.bio || stageDetail(profile.level))}</p>
       </div>
       <div class="hero-actions">
-        <a class="primary-btn" href="#${chatHomePath()}">${chat ? "进入聊天 Circle" : "选择聊天 Circle"}</a>
+        <a class="primary-btn" href="#${chat ? chatHomePath() : "/chat"}">${chat ? "进入聊天 Circle" : pausedChat ? "恢复聊天 Circle" : "选择聊天 Circle"}</a>
         ${chat && Number(profile.level || 1) > 1 ? `<a class="secondary-btn" href="#/observe">观察 ${level(juniorLevel())}</a>` : ""}
         ${chat ? `<a class="secondary-btn" href="#/tasks">看挑战赛</a>` : ""}
       </div>
@@ -1009,7 +1221,25 @@ async function pageHome(token = routeRenderToken) {
       </section>
     ` : ""}
 
-    ${chat ? "" : `
+    ${starterSeatReminder ? `
+      <section class="notice rematch-notice starter-reminder">
+        <div>
+          <strong>完成一次周同步，保留活跃席位</strong>
+          <p>你已经至少 5 天没有更新进度。Starter 用周同步确认真实行动；连续 7 天没有同步时，管理员可能暂停席位并把空位留给新的申请者。</p>
+        </div>
+        <a class="secondary-btn" href="#${chatHomePath()}">去同步</a>
+      </section>
+    ` : ""}
+
+    ${chat ? "" : pausedChat ? `
+      <section class="notice paused-seat-notice">
+        <div>
+          <strong>Starter 席位已暂停</strong>
+          <p>${h(pausedChat.pause_reason || "连续 7 天没有完成周同步")}。暂停只释放名额，你仍可回看暂停前的聊天记录。</p>
+        </div>
+        <button class="primary-btn reactivateChat" data-membership="${pausedChat.id}" type="button">恢复匹配</button>
+      </section>
+    ` : `
       <section class="panel action-hub">
         <div class="section-head">
           <div>
@@ -1043,8 +1273,8 @@ async function pageHome(token = routeRenderToken) {
             <div><strong>${myCheckin?.apps ?? 0}</strong><span>申请</span></div>
             <div><strong>${myCheckin?.networking ?? 0}</strong><span>Networking</span></div>
           </div>
-          <p>${!chat ? "先加入聊天 Circle，凑齐成员后这里会开放周同步。" : chatForming ? "正在等待组队，凑齐 3 人后开始每周同步。" : myCheckin ? `已同步：${time(myCheckin.createdAt)}` : "这周还没有同步进展，先让小队知道你在哪里。"}</p>
-          <a class="secondary-btn" href="#${chatHomePath()}">${!chat ? "选择聊天 Circle" : chatForming ? "查看组队进度" : myCheckin ? "更新周同步" : "去同步"}</a>
+          <p>${pausedChat ? "席位恢复后可以继续周同步。" : !chat ? "先加入聊天 Circle，加入后就可以开始周同步。" : myCheckin ? `已同步：${time(myCheckin.createdAt)}` : chatForming ? "小队仍在匹配成员，你现在就可以先同步本周进度。" : "这周还没有同步进展，先让小队知道你在哪里。"}</p>
+          <a class="secondary-btn" href="#${chat ? chatHomePath() : "/chat"}">${pausedChat ? "恢复席位" : !chat ? "选择聊天 Circle" : myCheckin ? "更新周同步" : "去同步"}</a>
         </article>
         <article class="hub-card">
           <strong>申请时间线建议</strong>
@@ -1060,7 +1290,7 @@ async function pageHome(token = routeRenderToken) {
     ${renderReadyUnlockCard(readyUnlock)}
 
     <section class="metrics">
-      <div><strong>${chat ? "1" : "0"}</strong><span>长期聊天 Circle</span></div>
+      <div><strong>${chat ? "1" : pausedChat ? "暂停" : "0"}</strong><span>长期聊天 Circle</span></div>
       <div><strong>${taskCircles.length}</strong><span>进行中 Challenge</span></div>
       <div><strong>${submissionCount}</strong><span>主页成果</span></div>
       <div><strong>${Number(profile.level || 1) > 1 ? juniorCircles.length : invites.length}</strong><span>${Number(profile.level || 1) > 1 ? "可观察候选小队" : "阶段升级邀请"}</span></div>
@@ -1073,10 +1303,17 @@ async function pageHome(token = routeRenderToken) {
             <p class="eyebrow">long-term circle</p>
             <h2>聊天 Circle</h2>
           </div>
-          <a class="text-btn" href="#${chatHomePath()}">${chat ? "进入" : "选择"}</a>
+          <a class="text-btn" href="#${chat ? chatHomePath() : "/chat"}">${chat ? "进入" : pausedChat ? "恢复" : "选择"}</a>
         </div>
         ${chat ? circleCard(chat, "这是你唯一的长期目标小队。建议持续同步进展、互相提醒节奏，而不是频繁切换。") : `
-          <p class="muted">你还没有聊天 Circle。每个人只能加入一个，保证小队成员目标集中、关系稳定。</p>
+          ${pausedChat ? `
+            <article class="mini-card paused-circle-card">
+              <div class="pill-row"><span class="pill warm">席位暂停</span><span class="pill good">Starter</span></div>
+              <h3>${h(circleDisplayName(pausedChat.groups))}</h3>
+              <p>${h(pausedChat.pause_reason || "连续 7 天没有完成周同步")}</p>
+              <button class="secondary-btn reactivateChat" data-membership="${pausedChat.id}" type="button">恢复匹配</button>
+            </article>
+          ` : `<p class="muted">你还没有聊天 Circle。每个人只能加入一个，保证小队成员目标集中、关系稳定。</p>`}
         `}
       </div>
       <div class="panel">
@@ -1128,20 +1365,23 @@ async function pageHome(token = routeRenderToken) {
   `);
   bindReadyUnlockButton();
   bindInviteButtons();
+  bindReactivateChatButtons();
 }
 
 function circleCard(group, detail = "") {
+  const unreadCount = unreadByGroup.get(group.id)?.count || 0;
   return `
     <article class="mini-card">
       <div class="pill-row">
         <span class="pill ${group.circle_type === "task" ? "dark" : "warm"}">${circleTypeName(group.circle_type)}</span>
         <span class="pill good">${circleLevelLabel(group)}</span>
         <span class="pill">${h(group.status)}</span>
+        <span data-unread-group="${group.id}" ${unreadCount ? "" : "hidden"}>${unreadBadge(unreadCount, "card-unread")}</span>
       </div>
       <h3>${h(circleDisplayName(group))}</h3>
       <p>${h(detail || group.topic || "")}</p>
       <div class="button-row">
-        <a class="secondary-btn" href="#/group/${group.id}">${group.circle_type === "exploration" && group.status === "forming" ? "查看组队进度" : "进入讨论"}</a>
+        <a class="secondary-btn" href="#/group/${group.id}">进入讨论</a>
         ${group.circle_type === "task" ? `<a class="primary-btn" href="#/work/${group.id}">打开工作台 / 提交作品</a>` : ""}
       </div>
     </article>
@@ -1165,7 +1405,7 @@ function observeCircleCard(group) {
   `;
 }
 
-function renderChatMessages(messages) {
+function renderChatMessages(messages, unreadAfter = null) {
   if (!messages.length) return `
     <div class="chat-empty">
       <div class="chat-empty-mark">C</div>
@@ -1174,11 +1414,19 @@ function renderChatMessages(messages) {
     </div>
   `;
   let lastDay = "";
+  let unreadDividerShown = false;
+  const unreadBoundary = unreadAfter ? new Date(unreadAfter).getTime() : 0;
   return messages.map(msg => {
     const day = messageDay(msg.created_at);
     const divider = day !== lastDay ? `<div class="day-divider"><span>${h(day)}</span></div>` : "";
+    const isUnread = !unreadDividerShown
+      && unreadBoundary > 0
+      && msg.user_id !== user?.id
+      && new Date(msg.created_at).getTime() > unreadBoundary;
+    const unreadDivider = isUnread ? `<div class="unread-divider"><span>以下为新消息</span></div>` : "";
+    if (isUnread) unreadDividerShown = true;
     lastDay = day;
-    return `${divider}${renderChatBubble(msg)}`;
+    return `${divider}${unreadDivider}${renderChatBubble(msg)}`;
   }).join("");
 }
 
@@ -1276,7 +1524,7 @@ function parsedCheckins(messages, fromDate = null) {
     .sort((a, b) => b.score - a.score || new Date(b.createdAt) - new Date(a.createdAt));
 }
 
-function readyEligibility(currentProfile, messages, chat, storedCheckins = null) {
+function readyEligibility(currentProfile, messages, chat, storedCheckins = null, activeMemberCount = 0) {
   const show = ["Spring Week", "Summer Internship"].includes(profileValue(currentProfile, "application_track", "Spring Week")) &&
     Number(currentProfile?.level || 1) === 1;
   if (!show) return { show: false, eligible: false, checks: [] };
@@ -1309,6 +1557,7 @@ function readyEligibility(currentProfile, messages, chat, storedCheckins = null)
 
   const checks = [
     { ok: hasChat, text: "已经加入一个长期聊天 Circle" },
+    { ok: hasChat && Number(activeMemberCount || 0) >= 3, text: "小队至少有 3 名活跃成员" },
     { ok: profileComplete, text: "申请画像完整：岗位、进度和强度清楚" },
     { ok: Boolean(currentCheckin), text: "本周完成一次周同步" },
     { ok: steadySync, text: "至少连续两周同步，证明行动节奏稳定" }
@@ -1513,8 +1762,11 @@ function renderPeerLeague(league, currentGroup) {
 async function pageChatLobby(token = routeRenderToken) {
   if (!(await requireUser())) return;
   const currentProfile = profile;
-  const mine = await memberships();
-  const juniorCircles = await juniorChatCircles();
+  const [mine, juniorCircles, pausedChat] = await Promise.all([
+    memberships(),
+    juniorChatCircles(),
+    pausedChatMembership()
+  ]);
   const chat = mine.find(m => m.groups?.circle_type === "exploration")?.groups;
   const topics = chatTopicsForProfile(currentProfile);
   const chatLevel = chatCircleLevel(currentProfile);
@@ -1543,6 +1795,15 @@ async function pageChatLobby(token = routeRenderToken) {
     </section>
 
     ${chat ? notice(`你已经有自己的长期目标小队：「${circleDisplayName(chat)}」。入口放在「今日」页，这里继续作为广场展示。`) : ""}
+    ${pausedChat ? `
+      <section class="notice paused-seat-notice">
+        <div>
+          <strong>你的 Starter 席位已暂停</strong>
+          <p>${h(pausedChat.pause_reason || "连续 7 天没有完成周同步")}。恢复后优先回到原小队，原小队已满时会自动重新匹配。</p>
+        </div>
+        <button class="primary-btn reactivateChat" data-membership="${pausedChat.id}" type="button">恢复匹配</button>
+      </section>
+    ` : ""}
     ${needsRematch ? `
       <section class="notice rematch-notice">
         <div>
@@ -1585,7 +1846,7 @@ async function pageChatLobby(token = routeRenderToken) {
           <p>${h(item.desc)}</p>
           <div class="match-note">组队依据：${h(profileValue(currentProfile, "application_track", "Spring Week"))} · ${level(item.level || chatLevel)} · ${h(item.role)}</div>
           ${item.recommended
-            ? `<button class="primary-btn joinChat" data-topic="${h(item.topic)}" data-level="${Number(item.level || chatLevel)}" ${chat ? "disabled" : ""}>${chat ? "已有目标小队" : "加入这个 Circle"}</button>`
+            ? `<button class="primary-btn joinChat" data-topic="${h(item.topic)}" data-level="${Number(item.level || chatLevel)}" ${chat || pausedChat ? "disabled" : ""}>${chat ? "已有目标小队" : pausedChat ? "先恢复暂停席位" : "加入这个 Circle"}</button>`
             : `<a class="secondary-btn" href="#/onboarding">修改目标岗位后加入</a>`}
         </article>
       `).join("")}
@@ -1635,6 +1896,8 @@ async function pageChatLobby(token = routeRenderToken) {
       go(`/group/${data}`);
     });
   }
+
+  bindReactivateChatButtons();
 
 }
 
@@ -1935,11 +2198,15 @@ async function pageAdmin(token = routeRenderToken) {
     layout(`<section class="panel">${notice("只有管理员可以进入后台。", "error")}</section>`);
     return;
   }
-  const [challenges, submissions] = await Promise.all([
+  const [challenges, submissions, starterMembershipResult] = await Promise.all([
     adminChallenges(),
-    adminSubmissions()
+    adminSubmissions(),
+    adminStarterMemberships()
   ]);
   const submissionGroups = groupSubmissionsByTask(submissions);
+  const starterMemberships = starterMembershipResult.rows;
+  const starterNeedsAttention = starterMemberships.filter(item => item.needs_attention).length;
+  const pausedStarterSeats = starterMemberships.filter(item => item.membership_status === "paused").length;
   const toLocalInput = value => {
     const date = new Date(value);
     return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
@@ -1955,6 +2222,47 @@ async function pageAdmin(token = routeRenderToken) {
         <h1>运营后台</h1>
         <p>每次发布都会创建一个独立 Challenge 赛期。截止后关闭赛期，再从提交中选出第 1、2、3 名。</p>
       </div>
+    </section>
+
+    <section class="panel starter-seat-panel">
+      <div class="section-head">
+        <div>
+          <p class="eyebrow">starter seat health</p>
+          <h2>Starter 席位管理</h2>
+          <p class="muted">连续 7 天没有周同步的成员会被标记，由你人工确认后暂停。暂停会释放名额，并保留暂停前的聊天记录；用户回来后可以恢复匹配。</p>
+        </div>
+        <div class="pill-row">
+          <span class="pill ${starterNeedsAttention ? "warm" : "good"}">${starterNeedsAttention} 个待查看</span>
+          <span class="pill">${pausedStarterSeats} 个已暂停</span>
+        </div>
+      </div>
+      ${starterMembershipResult.error ? notice(
+        /admin_starter_memberships|schema cache|function/i.test(starterMembershipResult.error.message || "")
+          ? "Starter 席位管理还没有写入 Supabase。运行本次新增 SQL 后，这里会显示成员活跃情况。"
+          : starterMembershipResult.error.message,
+        "error"
+      ) : `
+        <div class="starter-seat-list">
+          ${starterMemberships.map(item => `
+            <article class="starter-seat-row ${item.needs_attention ? "needs-attention" : ""}">
+              <div class="starter-seat-person">
+                <strong>${h(item.display_name || "用户")}</strong>
+                <span>${h(circleDisplayName({ name: item.group_name, circle_type: "exploration" }))}</span>
+              </div>
+              <div class="starter-seat-signals">
+                <span>加入 ${time(item.joined_at)}</span>
+                <span>最近周同步 ${item.last_checkin_at ? time(item.last_checkin_at) : "从未"}</span>
+                <span>最近发言 ${item.last_message_at ? time(item.last_message_at) : "从未"}</span>
+              </div>
+              <div class="starter-seat-action">
+                ${item.membership_status === "paused"
+                  ? `<span class="pill warm">已暂停</span><button class="secondary-btn toggleStarterSeat" data-membership="${item.membership_id}" data-paused="false" type="button">恢复席位</button>`
+                  : `${item.needs_attention ? `<span class="pill warm">7 天未同步</span>` : `<span class="pill good">正常</span>`}<button class="secondary-btn toggleStarterSeat" data-membership="${item.membership_id}" data-paused="true" type="button">暂停席位</button>`}
+              </div>
+            </article>
+          `).join("") || `<p class="muted">目前没有 Starter 聊天 Circle 成员。</p>`}
+        </div>
+      `}
     </section>
 
     <section class="two-col wide-left">
@@ -2056,6 +2364,31 @@ async function pageAdmin(token = routeRenderToken) {
       else if (routePath() === "/admin") await renderRoute();
     });
   });
+  document.querySelectorAll(".toggleStarterSeat").forEach(button => {
+    button.addEventListener("click", async () => {
+      const shouldPause = button.dataset.paused === "true";
+      let reason = "";
+      if (shouldPause) {
+        reason = prompt("暂停原因会展示给用户。", "连续 7 天未完成周同步") || "";
+        if (!reason.trim()) return;
+        if (!confirm("暂停后会立即释放这个 Circle 的一个名额，并保留暂停前的聊天记录。确定继续吗？")) return;
+      } else if (!confirm("确定恢复这个 Starter 席位吗？如果原 Circle 已满，需要让用户自行恢复匹配。")) {
+        return;
+      }
+      button.disabled = true;
+      const { error } = await db.rpc("admin_set_starter_seat", {
+        p_membership_id: button.dataset.membership,
+        p_paused: shouldPause,
+        p_reason: reason || "管理员恢复席位"
+      });
+      if (error) {
+        button.disabled = false;
+        alert(error.message);
+      } else if (routePath() === "/admin") {
+        await renderRoute();
+      }
+    });
+  });
   document.querySelectorAll(".clearRank").forEach(button => {
     button.addEventListener("click", async () => {
       button.disabled = true;
@@ -2148,7 +2481,7 @@ async function pageProfile(profileId, token = routeRenderToken) {
       <div>
         <p class="eyebrow">public profile</p>
         <h1>${h(targetProfile.display_name || "未命名用户")}</h1>
-        <p>${level(targetProfile.level)} · ${h(targetProfile.stage)} · ${h(profileValue(targetProfile, "target_role", targetProfile.direction || ""))}</p>
+        <p>${level(targetProfile.level)} · ${h(profileValue(targetProfile, "application_track", "Spring Week"))} · ${h(profileValue(targetProfile, "target_role", targetProfile.direction || ""))}</p>
         <p>${h(targetProfile.bio || "还没有填写介绍。")}</p>
         <div class="profile-chip-grid inline-profile-chips">${renderProfileChips(targetProfile)}</div>
         <div class="button-row">
@@ -2214,11 +2547,6 @@ async function pageOnboarding(token = routeRenderToken) {
       <form id="profileForm" class="form-card flat">
         <label>昵称<input name="display_name" required minlength="1" maxlength="40" value="${h(profile.display_name || "")}"></label>
         <div class="form-grid">
-          <label>年级 / 身份
-            <select name="stage">
-              ${["Freshman", "Sophomore", "Junior", "Master", "Working", "Other"].map(stage => `<option ${profile.stage === stage ? "selected" : ""}>${stage}</option>`).join("")}
-            </select>
-          </label>
           <label>申请路径
             <select name="application_track">
               ${applicationTracks.map(item => `<option ${profileValue(profile, "application_track", "Spring Week") === item ? "selected" : ""}>${item}</option>`).join("")}
@@ -2251,7 +2579,6 @@ async function pageOnboarding(token = routeRenderToken) {
     const fd = new FormData(e.currentTarget);
     const payload = {
       display_name: String(fd.get("display_name") || "").trim(),
-      stage: String(fd.get("stage") || ""),
       direction: String(fd.get("target_role") || "").trim(),
       bio: String(fd.get("bio") || "").trim(),
       application_track: String(fd.get("application_track") || ""),
@@ -2265,7 +2592,6 @@ async function pageOnboarding(token = routeRenderToken) {
     if (error && /column|schema|cache/i.test(error.message || "")) {
       const legacyPayload = {
         display_name: payload.display_name,
-        stage: payload.stage,
         direction: payload.direction,
         bio: payload.bio
       };
@@ -2477,10 +2803,15 @@ async function pageGroup(groupId, token = routeRenderToken) {
     }
     throw error;
   }
+  const unreadBoundary = await groupReadBoundary(groupId);
   let messageLimit = 100;
   const messagePageSize = 100;
   const mediaUrlCache = new Map();
   let messageChannel = null;
+  let mobileFeedOpen = false;
+  let detachMobileFeedEvents = null;
+  let currentUserIsMember = false;
+  let initialUnreadPositioned = false;
 
   async function readMembers() {
     const { data, error: memberError } = await db
@@ -2536,7 +2867,7 @@ async function pageGroup(groupId, token = routeRenderToken) {
     const older = messages.length >= messageLimit
       ? `<button class="load-older-btn" id="loadOlderMessages" type="button">加载更早消息</button>`
       : "";
-    return `${older}${renderChatMessages(messages)}`;
+    return `${older}${renderChatMessages(messages, unreadBoundary)}`;
   }
 
   function bindOlderMessages() {
@@ -2570,6 +2901,9 @@ async function pageGroup(groupId, token = routeRenderToken) {
     scroll.innerHTML = messageStreamMarkup(messages);
     bindOlderMessages();
     if (scrollToBottom) scroll.scrollTop = scroll.scrollHeight;
+    if (scrollToBottom && currentUserIsMember && messages.length) {
+      await markGroupRead(groupId, messages.at(-1).created_at);
+    }
   }
 
   let passiveRefreshes = 0;
@@ -2605,6 +2939,7 @@ async function pageGroup(groupId, token = routeRenderToken) {
     }
     if (!force && document.activeElement?.matches?.("#messageInput, #weeklyForm input, #weeklyForm textarea")) return;
     const isMember = members.some(m => m.user_id === user.id);
+    currentUserIsMember = isMember;
     const isWaitingForMembers = group.circle_type === "exploration" && members.length < 3;
     const isLowerObservedChat = !isMember && group.circle_type === "exploration" && Number(group.level || 1) < Number(profile.level || 1);
     const expectedObservedTopic = `${profileValue(profile, "application_track", "Spring Week") === "Summer Internship" ? "Summer" : "Spring Week"} ${level(group.level)} - ${canonicalChatRole(profileValue(profile, "target_role", profile.direction || ""))} Circle`;
@@ -2619,18 +2954,23 @@ async function pageGroup(groupId, token = routeRenderToken) {
     const checkins = storedCheckins || weeklyCheckins(messages);
     const myCheckin = latestCheckinForUser(checkins);
     const myCheckedIn = Boolean(myCheckin);
+    const mobileFeedLabel = group.circle_type === "task"
+      ? "挑战看板"
+      : isLowerObservedChat
+        ? "观察看板"
+        : "进度";
     const messageDraft = document.getElementById("messageInput")?.value || "";
     const currentWeeklyForm = document.getElementById("weeklyForm");
     const weeklyDraft = currentWeeklyForm ? new FormData(currentWeeklyForm) : null;
     layout(`
-      <section class="chat-workspace">
+      <section class="chat-workspace${mobileFeedOpen ? " mobile-feed-open" : ""}" id="chatWorkspace">
         <aside class="chat-side">
           <a href="${isLowerObservedChat ? "#/observe" : "#/home"}" class="side-back">‹ 返回</a>
           <div class="side-card main-side-card">
             <div class="pill-row">
               <span class="pill ${group.circle_type === "task" ? "dark" : "warm"}">${circleTypeName(group.circle_type)}</span>
               <span class="pill good">${circleLevelLabel(group)}</span>
-              ${isWaitingForMembers ? `<span class="pill warm">等待组队</span>` : ""}
+              ${isWaitingForMembers ? `<span class="pill warm">匹配中</span>` : ""}
               ${isLowerObservedChat ? `<span class="pill">只读观察</span>` : ""}
             </div>
             <h2>${h(circleDisplayName(group))}</h2>
@@ -2663,7 +3003,7 @@ async function pageGroup(groupId, token = routeRenderToken) {
               : group.circle_type === "task"
               ? `Challenge 交付：${h(group.task?.deliverable || "提交小组作品。")}`
               : isWaitingForMembers
-              ? `已匹配 ${members.length}/3 人，凑齐 3 人后开放聊天和周同步。`
+              ? `已匹配 ${members.length}/3 人。聊天和周同步已经开放，达到 3 人后开放周榜。`
               : "长期聊天 Circle，适合持续复盘和沉淀关系。"}
             </p>
             <div class="side-actions">
@@ -2681,13 +3021,16 @@ async function pageGroup(groupId, token = routeRenderToken) {
               <h1>${h(circleDisplayName(group))}</h1>
               <p>${members.length}/${group.max_members} · ${h(activeNames || topic || "")}</p>
             </div>
-            <button class="icon-btn" id="moreBtn" type="button">•••</button>
+            <div class="chat-top-actions">
+              <button class="mobile-progress-btn" id="mobileFeedOpen" type="button" aria-controls="mobileFeedPanel" aria-expanded="${mobileFeedOpen}">${h(mobileFeedLabel)}</button>
+              <button class="icon-btn" id="moreBtn" type="button" aria-label="更多 Circle 选项" title="更多 Circle 选项">•••</button>
+            </div>
           </header>
           <div class="chat-menu" id="chatMenu" hidden>
             <div class="pill-row">
               <span class="pill ${group.circle_type === "task" ? "dark" : "warm"}">${circleTypeName(group.circle_type)}</span>
               <span class="pill good">${circleLevelLabel(group)}</span>
-              ${isWaitingForMembers ? `<span class="pill warm">等待组队</span>` : ""}
+              ${isWaitingForMembers ? `<span class="pill warm">匹配中</span>` : ""}
               ${isLowerObservedChat ? `<span class="pill">只读观察</span>` : ""}
             </div>
             <div class="chat-menu-context">
@@ -2698,7 +3041,7 @@ async function pageGroup(groupId, token = routeRenderToken) {
               : group.circle_type === "task"
               ? `Challenge 交付：${h(group.task?.deliverable || "提交小组作品。")}`
               : isWaitingForMembers
-              ? `正在等待更多同路人。凑齐 3 人后开放聊天和每周同步，目前已匹配 ${members.length} 人。`
+              ? `正在继续匹配同路人，目前已有 ${members.length} 人。你现在可以聊天和同步进度，达到 3 人后开放周榜。`
               : "这是长期聊天 Circle。建议稳定参与、持续复盘，不鼓励频繁退出换圈。"}
             </div>
             ${group.circle_type === "task" ? `<a href="#/work/${groupId}">Challenge 工作台</a>` : ""}
@@ -2726,7 +3069,7 @@ async function pageGroup(groupId, token = routeRenderToken) {
             ${messageStreamMarkup(messages)}
           </div>
           <footer class="composer">
-            ${isMember && !isWaitingForMembers ? `
+            ${isMember ? `
               <form id="messageForm">
                 <div class="composer-tools">
                   <span>${h(group.circle_type === "task" ? "挑战讨论" : "群聊")}</span>
@@ -2740,20 +3083,28 @@ async function pageGroup(groupId, token = routeRenderToken) {
                 </div>
                 <div class="upload-status" id="uploadStatus" role="status" aria-live="polite" hidden></div>
               </form>
-            ` : isMember && isWaitingForMembers
-              ? notice(`已匹配 ${members.length}/3 人。凑齐后自动开放聊天，你不需要重复加入。`)
-              : notice("你能查看这个 Circle，但不是成员，不能发言。")}
+            ` : notice("你能查看这个 Circle，但不是成员，不能发言。")}
           </footer>
         </div>
 
-        <aside class="chat-feed">
+        <button class="mobile-feed-backdrop" id="mobileFeedBackdrop" type="button" aria-label="关闭${h(mobileFeedLabel)}"></button>
+        <aside class="chat-feed" id="mobileFeedPanel" aria-label="${h(mobileFeedLabel)}">
+          <div class="mobile-feed-header">
+            <div>
+              <span>${h(circleDisplayName(group))}</span>
+              <strong>${h(mobileFeedLabel)}</strong>
+            </div>
+            <button class="mobile-feed-close" id="mobileFeedClose" type="button" aria-label="关闭${h(mobileFeedLabel)}" title="关闭">×</button>
+          </div>
           ${group.circle_type === "exploration" ? `
             <div class="feed-card">
               <div class="side-title">
                 <strong>同类 Circle 周榜</strong>
                 <span>${h(normalizedChatTopic(group.topic) || "Circle")}</span>
               </div>
-              ${renderPeerLeague(league, group)}
+              ${isWaitingForMembers
+                ? `<p class="muted compact-muted">达到 3 人正式成组后开放同类周榜。</p>`
+                : renderPeerLeague(league, group)}
             </div>
           ` : ""}
 
@@ -2776,10 +3127,12 @@ async function pageGroup(groupId, token = routeRenderToken) {
                 <p>看谁能提出清晰问题、推动讨论、总结结论、给出有依据的判断。</p>
               </div>
             ` : `
-              <p>${isWaitingForMembers ? "小队正在匹配成员，凑齐 3 人后开始本周同步。" : "这个 Circle 是长期目标小队。每周保留一份进展记录；提交后仍然可以更新。"}</p>
-              ${isWaitingForMembers ? "" : `<div class="rank-list">${renderWeeklyRank(checkins)}</div>`}
-              ${myCheckedIn && !isWaitingForMembers ? `<div class="notice success slim-notice">你这周已经同步过，下面会更新当前记录。</div>` : ""}
-              ${isMember && !isWaitingForMembers ? `
+              <p>${isWaitingForMembers ? "小队仍在匹配成员，但聊天和周同步已经开放；达到 3 人后显示本组排名。" : "这个 Circle 是长期目标小队。每周保留一份进展记录；提交后仍然可以更新。"}</p>
+              ${isWaitingForMembers
+                ? `<p class="muted compact-muted">已匹配 ${members.length}/3 人，正式成组后开放本组周榜。</p>`
+                : `<div class="rank-list">${renderWeeklyRank(checkins)}</div>`}
+              ${myCheckedIn ? `<div class="notice success slim-notice">你这周已经同步过，下面会更新当前记录。</div>` : ""}
+              ${isMember ? `
                 <form class="weekly-form" id="weeklyForm">
                   <div class="mini-grid">
                     <label>申请<input name="apps" type="number" min="0" max="200" value="${myCheckin?.apps ?? 0}"></label>
@@ -2812,8 +3165,45 @@ async function pageGroup(groupId, token = routeRenderToken) {
     }
 
     const scroll = document.getElementById("chatScroll");
-    if (scroll) scroll.scrollTop = scroll.scrollHeight;
+    if (scroll) {
+      const unreadDivider = scroll.querySelector(".unread-divider");
+      if (!initialUnreadPositioned && unreadDivider) {
+        unreadDivider.scrollIntoView({ block: "start" });
+        initialUnreadPositioned = true;
+      } else {
+        scroll.scrollTop = scroll.scrollHeight;
+      }
+    }
     bindOlderMessages();
+    if (isMember && messages.length) await markGroupRead(groupId, messages.at(-1).created_at);
+    if (detachMobileFeedEvents) detachMobileFeedEvents();
+    const workspace = document.getElementById("chatWorkspace");
+    const mobileFeedOpenButton = document.getElementById("mobileFeedOpen");
+    const mobileFeedCloseButton = document.getElementById("mobileFeedClose");
+    const mobileFeedBackdrop = document.getElementById("mobileFeedBackdrop");
+    const setMobileFeedOpen = (open, returnFocus = false) => {
+      mobileFeedOpen = open;
+      workspace?.classList.toggle("mobile-feed-open", open);
+      mobileFeedOpenButton?.setAttribute("aria-expanded", String(open));
+      if (open) mobileFeedCloseButton?.focus();
+      else if (returnFocus) mobileFeedOpenButton?.focus();
+    };
+    const handleMobileFeedOpen = () => setMobileFeedOpen(true);
+    const handleMobileFeedClose = () => setMobileFeedOpen(false, true);
+    const handleMobileFeedKeydown = event => {
+      if (event.key === "Escape" && mobileFeedOpen) handleMobileFeedClose();
+    };
+    mobileFeedOpenButton?.addEventListener("click", handleMobileFeedOpen);
+    mobileFeedCloseButton?.addEventListener("click", handleMobileFeedClose);
+    mobileFeedBackdrop?.addEventListener("click", handleMobileFeedClose);
+    document.addEventListener("keydown", handleMobileFeedKeydown);
+    detachMobileFeedEvents = () => {
+      mobileFeedOpenButton?.removeEventListener("click", handleMobileFeedOpen);
+      mobileFeedCloseButton?.removeEventListener("click", handleMobileFeedClose);
+      mobileFeedBackdrop?.removeEventListener("click", handleMobileFeedClose);
+      document.removeEventListener("keydown", handleMobileFeedKeydown);
+      detachMobileFeedEvents = null;
+    };
     const more = document.getElementById("moreBtn");
     const menu = document.getElementById("chatMenu");
     if (more && menu) more.addEventListener("click", () => menu.hidden = !menu.hidden);
@@ -3186,6 +3576,7 @@ async function pageGroup(groupId, token = routeRenderToken) {
 
   cleanupCurrentPage = () => {
     if (detachPasteUpload) detachPasteUpload();
+    if (detachMobileFeedEvents) detachMobileFeedEvents();
     if (messageChannel) {
       db.removeChannel(messageChannel);
       messageChannel = null;

@@ -4,10 +4,11 @@ circle 是一个面向海外中国留学生的 Spring Week / Summer 申请目标
 
 核心机制是：
 
-- 聊天 Circle：长期申请小队，每人同时只能加入 1 个，最多 6 人，按 Spring / Summer、聊天阶段和 Finance / Consulting 匹配；先进入等待组队，凑齐 3 人后开放聊天和周同步。
+- 聊天 Circle：长期申请小队，每人同时只能加入 1 个，最多 6 人，按 Spring / Summer、聊天阶段和 Finance / Consulting 匹配；加入后立即开放聊天和周同步，达到 3 人后正式成组并开放周榜。
 - Challenge Circle：运营者手动发布赛期，同一时间最多 2 个全站主赛，围绕 consulting mini-project、stock pitch、investment memo、business sense teardown、AI 产品方案等作品自动组队。
 - 阶段系统：聊天 Circle 只保留 Starter / Ready / Competitive 三层，Spring Week 和 Summer 都按这三层及 Finance / Consulting 匹配。
-- 升级机制：Starter 完整填写画像并连续两周同步后解锁 Ready；Ready 到 Competitive 由更高层级成员基于真实讨论和输出邀请确认。
+- 升级机制：Starter 所在小队至少有 3 名活跃成员、完整填写画像并连续两周同步后解锁 Ready；Ready 到 Competitive 由更高层级成员基于真实讨论和输出邀请确认。
+- Starter 席位健康：后台会标记连续 7 天没有周同步的 Starter，由管理员人工暂停；暂停会释放名额，用户可回看暂停前的聊天记录，回来后可以恢复匹配。
 - Challenge 主赛：Challenge 不按 Spring / Summer 分流，尽量让更多用户做同一道题；题目本身保留入门 / 进阶 / 高阶三档。
 - 成果信号：用户的 Challenge 作品、推荐标签和 Circle 排行会沉淀到个人主页；小组作品会记入所有参赛成员，而不是只记在最后提交者名下。
 
@@ -20,7 +21,8 @@ circle/
 ├── styles.css
 ├── config.js
 ├── supabase/
-│   └── schema.sql
+│   ├── schema.sql
+│   └── starter_seats_and_unread_20260928.sql
 └── README.md
 ```
 
@@ -32,7 +34,7 @@ circle/
 - Spring / Summer、目标岗位、当前进度、准备强度画像
 - 首页今日申请行动台
 - Starter / Ready / Competitive 三层聊天阶段
-- Ready 行为解锁：加入聊天 Circle、补全申请画像，并至少连续两周完成周同步
+- Ready 行为解锁：加入至少有 3 名活跃成员的聊天 Circle、补全申请画像，并至少连续两周完成周同步
 - 阶段升级只改变个人标签，不会自动退出原聊天 Circle；新层级 Circle 会开放，由用户主动决定是否切换
 - 切换 Spring / Summer 或 Finance / Consulting 岗位大类时，聊天阶段重置为 Starter，旧 Circle 暂时保留，由用户主动重新匹配
 - 本组周同步：每人每个 Circle 每周保留一份进度记录，可以反复更新；榜单每周重算，只是自报行动节奏，不用于判断水平或升级
@@ -59,6 +61,8 @@ circle/
 - Competitive 成员可以基于真实 Ready Circle 讨论邀请 Ready 用户升级
 - 接受 / 拒绝升级邀请
 - 类微信群聊界面，支持实时新消息和加载更早消息
+- 未读消息：导航和首页 Circle 卡片显示未读数，进入聊天后定位到“以下为新消息”并记录个人已读位置
+- Starter 席位管理：管理员可查看最近周同步和发言时间，人工暂停长期未同步的席位；用户可一键恢复原小队或重新匹配
 - Enter 发送消息，Shift + Enter 换行
 - 聊天上传图片和文件：图片在聊天里预览，文件以卡片形式打开
 - Challenge 作品在首次提交时冻结贡献成员；已提交的队伍不再补入新成员，后续编辑或离队也不会改掉原有署名
@@ -85,7 +89,9 @@ SQL Editor -> New query
 
 复制 `supabase/schema.sql` 的全部内容，粘贴并运行。
 
-如果你之前运行过旧版 SQL，数据库规则也需要更新。`schema.sql` 包含种子 Challenge 和状态整理语句；在已有真实用户数据的项目中，先备份并审阅脚本，不要不加检查地重复运行整份文件。脚本不会再创建模拟用户或虚拟成果。
+已经运行过旧版 `schema.sql` 的现有项目，只需运行 `supabase/starter_seats_and_unread_20260928.sql`，即可加入 Starter 席位管理和未读消息，不会删除现有用户、聊天或成果。
+
+如果你之前运行过旧版 SQL，数据库规则也需要更新。`schema.sql` 包含完整结构和状态整理语句；在已有真实用户数据的项目中，优先运行对应的小型迁移文件，不要不加检查地重复运行整份文件。脚本不会创建模拟用户、虚拟成果或示例 Challenge。
 
 聊天图片和文件使用 Supabase Storage 的 `chat-media` 私有桶。重新运行 SQL 后会自动创建桶和权限；支持选择、拖拽或粘贴上传，一次最多 10 个，单个文件默认限制为 50MB。
 
