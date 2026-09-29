@@ -2,6 +2,8 @@
 -- Safe to run in a fresh Supabase project.
 -- If you have important existing data, back it up before running destructive changes.
 
+begin;
+
 create extension if not exists pgcrypto;
 
 -- Drop old policies first so repeated runs are easier.
@@ -216,6 +218,11 @@ alter table public.messages add column if not exists media_size int;
 alter table public.group_members add column if not exists paused_at timestamptz;
 alter table public.group_members add column if not exists pause_reason text not null default '';
 alter table public.group_members drop constraint if exists group_members_status_check;
+update public.group_members
+set status = 'left',
+    left_at = coalesce(left_at, now())
+where status is null
+   or status not in ('active', 'paused', 'left', 'removed');
 alter table public.group_members add constraint group_members_status_check check (status in ('active', 'paused', 'left', 'removed'));
 
 alter table public.task_submissions add column if not exists task_id uuid references public.tasks(id) on delete cascade;
@@ -278,10 +285,27 @@ alter table public.circle_requests add column if not exists admin_note text not 
 alter table public.circle_requests add column if not exists created_at timestamptz not null default now();
 alter table public.circle_requests add column if not exists updated_at timestamptz not null default now();
 
-update public.profiles set level = 3 where level > 3;
-update public.tasks set level = 3 where level > 3;
-update public.groups set level = 3 where level > 3;
-update public.circle_requests set level = 3 where level > 3;
+alter table public.profiles drop constraint if exists profiles_level_check;
+alter table public.tasks drop constraint if exists tasks_level_check;
+alter table public.groups drop constraint if exists groups_level_check;
+alter table public.circle_requests drop constraint if exists circle_requests_level_check;
+alter table public.task_submissions drop constraint if exists task_submissions_award_rank_check;
+
+update public.profiles
+set level = greatest(1, least(3, coalesce(level, 1)))
+where level is null or level not between 1 and 3;
+
+update public.tasks
+set level = greatest(1, least(3, coalesce(level, 1)))
+where level is null or level not between 1 and 3;
+
+update public.groups
+set level = greatest(1, least(3, coalesce(level, 1)))
+where level is null or level not between 1 and 3;
+
+update public.circle_requests
+set level = greatest(1, least(3, coalesce(level, 1)))
+where level is null or level not between 1 and 3;
 update public.promotion_invites set status = 'cancelled' where from_level > 3 or target_level > 3;
 update public.task_submissions set award_rank = null, award_title = null where award_rank is not null and award_rank not between 1 and 3;
 
@@ -289,15 +313,10 @@ update public.profiles
 set is_admin = true
 where email = '18901528810@163.com';
 
-alter table public.profiles drop constraint if exists profiles_level_check;
 alter table public.profiles add constraint profiles_level_check check (level between 1 and 3);
-alter table public.tasks drop constraint if exists tasks_level_check;
 alter table public.tasks add constraint tasks_level_check check (level between 1 and 3);
-alter table public.groups drop constraint if exists groups_level_check;
 alter table public.groups add constraint groups_level_check check (level between 1 and 3);
-alter table public.circle_requests drop constraint if exists circle_requests_level_check;
 alter table public.circle_requests add constraint circle_requests_level_check check (level between 1 and 3);
-alter table public.task_submissions drop constraint if exists task_submissions_award_rank_check;
 alter table public.task_submissions add constraint task_submissions_award_rank_check check (award_rank between 1 and 3);
 
 with duplicate_awards as (
@@ -3105,3 +3124,7 @@ where status = 'pending'
   and (from_level <> 2 or target_level <> 3);
 
 select public.refresh_challenge_lifecycle();
+
+notify pgrst, 'reload schema';
+
+commit;
