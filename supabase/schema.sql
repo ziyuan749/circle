@@ -13,7 +13,7 @@ begin
     select schemaname, tablename, policyname
     from pg_policies
     where schemaname = 'public'
-      and tablename in ('profiles', 'tasks', 'groups', 'group_members', 'messages', 'task_submissions', 'task_submission_contributors', 'promotion_invites', 'profile_endorsements', 'weekly_checkins', 'circle_requests')
+      and tablename in ('profiles', 'tasks', 'groups', 'group_members', 'messages', 'group_read_states', 'task_submissions', 'task_submission_contributors', 'promotion_invites', 'profile_endorsements', 'weekly_checkins', 'circle_requests')
   loop
     execute format('drop policy if exists %I on %I.%I', pol.policyname, pol.schemaname, pol.tablename);
   end loop;
@@ -73,9 +73,11 @@ create table if not exists public.group_members (
   group_id uuid not null references public.groups(id) on delete cascade,
   user_id uuid not null references public.profiles(id) on delete cascade,
   role text not null default 'member' check (role in ('member', 'host', 'observer', 'admin')),
-  status text not null default 'active' check (status in ('active', 'left', 'removed')),
+  status text not null default 'active' check (status in ('active', 'paused', 'left', 'removed')),
   joined_at timestamptz not null default now(),
   left_at timestamptz,
+  paused_at timestamptz,
+  pause_reason text not null default '',
   unique(group_id, user_id)
 );
 
@@ -91,6 +93,15 @@ create table if not exists public.messages (
   media_mime text,
   media_size int,
   created_at timestamptz not null default now()
+);
+
+create table if not exists public.group_read_states (
+  group_id uuid not null references public.groups(id) on delete cascade,
+  user_id uuid not null references public.profiles(id) on delete cascade,
+  last_read_at timestamptz not null default now(),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  primary key (group_id, user_id)
 );
 
 create table if not exists public.task_submissions (
@@ -202,6 +213,11 @@ alter table public.messages add column if not exists media_name text;
 alter table public.messages add column if not exists media_mime text;
 alter table public.messages add column if not exists media_size int;
 
+alter table public.group_members add column if not exists paused_at timestamptz;
+alter table public.group_members add column if not exists pause_reason text not null default '';
+alter table public.group_members drop constraint if exists group_members_status_check;
+alter table public.group_members add constraint group_members_status_check check (status in ('active', 'paused', 'left', 'removed'));
+
 alter table public.task_submissions add column if not exists task_id uuid references public.tasks(id) on delete cascade;
 alter table public.task_submissions add column if not exists group_id uuid references public.groups(id) on delete cascade;
 alter table public.task_submissions add column if not exists submitted_by uuid references public.profiles(id) on delete cascade;
@@ -307,6 +323,14 @@ create index if not exists idx_group_members_user_status on public.group_members
 create index if not exists idx_group_members_group_status on public.group_members(group_id, status);
 create index if not exists idx_messages_group_created on public.messages(group_id, created_at);
 create index if not exists idx_messages_user_created on public.messages(user_id, created_at desc);
+create index if not exists idx_group_read_states_user on public.group_read_states(user_id, updated_at desc);
+
+insert into public.group_read_states (group_id, user_id, last_read_at, created_at, updated_at)
+select gm.group_id, gm.user_id, now(), now(), now()
+from public.group_members gm
+where gm.status = 'active'
+on conflict (group_id, user_id) do nothing;
+
 create index if not exists idx_tasks_level_status on public.tasks(level, status);
 create index if not exists idx_submissions_task_score on public.task_submissions(task_id, score desc, created_at asc);
 create index if not exists idx_submissions_user_created on public.task_submissions(submitted_by, created_at desc);
@@ -488,6 +512,52 @@ create trigger protect_profile_admin_flag
 before insert or update on public.profiles
 for each row execute function public.protect_profile_admin_flag();
 
+create or replace function public.protect_paused_chat_seat()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_circle_type text;
+  v_old_status text;
+begin
+  if tg_op = 'UPDATE' then
+    v_old_status := old.status;
+  end if;
+
+  if new.status = 'active'
+    and (tg_op = 'INSERT' or v_old_status is distinct from 'active')
+    and coalesce(current_setting('app.allow_starter_reactivation', true), '') <> 'on' then
+    select g.circle_type into v_circle_type
+    from public.groups g
+    where g.id = new.group_id;
+
+    if v_circle_type = 'exploration' and (
+      (tg_op = 'UPDATE' and v_old_status = 'paused')
+      or exists (
+        select 1
+        from public.group_members paused_membership
+        join public.groups paused_group on paused_group.id = paused_membership.group_id
+        where paused_membership.user_id = new.user_id
+          and paused_membership.status = 'paused'
+          and paused_membership.id <> new.id
+          and paused_group.circle_type = 'exploration'
+      )
+    ) then
+      raise exception '你的 Starter 席位已暂停，请先恢复匹配';
+    end if;
+  end if;
+
+  return new;
+end;
+$$;
+
+drop trigger if exists protect_paused_chat_seat on public.group_members;
+create trigger protect_paused_chat_seat
+before insert or update of status on public.group_members
+for each row execute function public.protect_paused_chat_seat();
+
 create or replace function public.is_group_member(p_group_id uuid, p_user_id uuid)
 returns boolean
 language sql
@@ -543,6 +613,363 @@ as $$
         )
       )
   );
+$$;
+
+create or replace function public.can_view_group_content(
+  p_group_id uuid,
+  p_user_id uuid,
+  p_created_at timestamptz
+)
+returns boolean
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select public.can_view_group(p_group_id, p_user_id)
+    or exists (
+      select 1
+      from public.group_members historical_membership
+      where historical_membership.group_id = p_group_id
+        and historical_membership.user_id = p_user_id
+        and historical_membership.status = 'paused'
+        and p_created_at <= historical_membership.paused_at
+    );
+$$;
+
+create or replace function public.my_unread_group_counts()
+returns table (
+  group_id uuid,
+  circle_type text,
+  unread_count int,
+  last_message_at timestamptz
+)
+language plpgsql
+stable
+security definer
+set search_path = public
+as $$
+declare
+  v_user_id uuid := auth.uid();
+begin
+  if v_user_id is null then
+    raise exception 'Not authenticated';
+  end if;
+
+  return query
+  select
+    gm.group_id,
+    g.circle_type,
+    count(m.id) filter (
+      where m.user_id <> v_user_id
+        and m.created_at > coalesce(read_state.last_read_at, gm.joined_at)
+    )::int as unread_count,
+    max(m.created_at) filter (
+      where m.user_id <> v_user_id
+        and m.created_at > coalesce(read_state.last_read_at, gm.joined_at)
+    ) as last_message_at
+  from public.group_members gm
+  join public.groups g on g.id = gm.group_id
+  left join public.group_read_states read_state
+    on read_state.group_id = gm.group_id
+   and read_state.user_id = gm.user_id
+  left join public.messages m on m.group_id = gm.group_id
+  where gm.user_id = v_user_id
+    and gm.status = 'active'
+    and g.status in ('forming', 'active', 'full', 'completed')
+  group by gm.group_id, g.circle_type, gm.joined_at, read_state.last_read_at
+  having count(m.id) filter (
+    where m.user_id <> v_user_id
+      and m.created_at > coalesce(read_state.last_read_at, gm.joined_at)
+  ) > 0
+  order by max(m.created_at) filter (
+    where m.user_id <> v_user_id
+      and m.created_at > coalesce(read_state.last_read_at, gm.joined_at)
+  ) desc nulls last;
+end;
+$$;
+
+create or replace function public.mark_group_read(
+  p_group_id uuid,
+  p_read_through timestamptz default null
+)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_user_id uuid := auth.uid();
+  v_joined_at timestamptz;
+  v_read_at timestamptz;
+begin
+  if v_user_id is null then
+    raise exception 'Not authenticated';
+  end if;
+
+  select gm.joined_at
+  into v_joined_at
+  from public.group_members gm
+  where gm.group_id = p_group_id
+    and gm.user_id = v_user_id
+    and gm.status = 'active';
+
+  if v_joined_at is null then
+    raise exception '只有当前 Circle 成员可以更新已读位置';
+  end if;
+
+  v_read_at := greatest(v_joined_at, least(coalesce(p_read_through, now()), now()));
+
+  insert into public.group_read_states (group_id, user_id, last_read_at, updated_at)
+  values (p_group_id, v_user_id, v_read_at, now())
+  on conflict (group_id, user_id)
+  do update set
+    last_read_at = greatest(public.group_read_states.last_read_at, excluded.last_read_at),
+    updated_at = now();
+end;
+$$;
+
+create or replace function public.admin_starter_memberships()
+returns table (
+  membership_id uuid,
+  group_id uuid,
+  group_name text,
+  user_id uuid,
+  display_name text,
+  membership_status text,
+  joined_at timestamptz,
+  paused_at timestamptz,
+  pause_reason text,
+  last_checkin_at timestamptz,
+  last_message_at timestamptz,
+  needs_attention boolean
+)
+language plpgsql
+stable
+security definer
+set search_path = public
+as $$
+declare
+  v_user_id uuid := auth.uid();
+begin
+  if v_user_id is null or not public.is_admin(v_user_id) then
+    raise exception '只有管理员可以查看 Starter 席位';
+  end if;
+
+  return query
+  select
+    gm.id,
+    gm.group_id,
+    g.name,
+    gm.user_id,
+    coalesce(p.display_name, '用户'),
+    gm.status,
+    gm.joined_at,
+    gm.paused_at,
+    gm.pause_reason,
+    checkin.last_checkin_at,
+    message.last_message_at,
+    (
+      gm.status = 'active'
+      and gm.joined_at <= now() - interval '7 days'
+      and (checkin.last_checkin_at is null or checkin.last_checkin_at < now() - interval '7 days')
+    ) as needs_attention
+  from public.group_members gm
+  join public.groups g on g.id = gm.group_id
+  join public.profiles p on p.id = gm.user_id
+  left join lateral (
+    select max(wc.updated_at) as last_checkin_at
+    from public.weekly_checkins wc
+    where wc.group_id = gm.group_id
+      and wc.user_id = gm.user_id
+  ) checkin on true
+  left join lateral (
+    select max(m.created_at) as last_message_at
+    from public.messages m
+    where m.group_id = gm.group_id
+      and m.user_id = gm.user_id
+  ) message on true
+  where g.circle_type = 'exploration'
+    and g.level = 1
+    and p.level = 1
+    and gm.status in ('active', 'paused')
+  order by (
+    gm.status = 'active'
+    and gm.joined_at <= now() - interval '7 days'
+    and (checkin.last_checkin_at is null or checkin.last_checkin_at < now() - interval '7 days')
+  ) desc, gm.paused_at desc nulls last, gm.joined_at asc;
+end;
+$$;
+
+create or replace function public.admin_set_starter_seat(
+  p_membership_id uuid,
+  p_paused boolean,
+  p_reason text default '连续 7 天未完成周同步'
+)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_admin_id uuid := auth.uid();
+  v_membership public.group_members%rowtype;
+  v_group public.groups%rowtype;
+  v_profile_level int;
+begin
+  if v_admin_id is null or not public.is_admin(v_admin_id) then
+    raise exception '只有管理员可以管理 Starter 席位';
+  end if;
+
+  select * into v_membership
+  from public.group_members
+  where id = p_membership_id;
+
+  if not found then
+    raise exception '没有找到这个成员席位';
+  end if;
+
+  select * into v_group from public.groups where id = v_membership.group_id;
+  select level into v_profile_level from public.profiles where id = v_membership.user_id;
+
+  if v_group.circle_type <> 'exploration' or v_group.level <> 1 or coalesce(v_profile_level, 1) <> 1 then
+    raise exception '只能暂停 Starter 聊天 Circle 的席位';
+  end if;
+
+  perform pg_advisory_xact_lock(hashtextextended('chat-user:' || v_membership.user_id::text, 0));
+  perform pg_advisory_xact_lock(hashtextextended('chat-circle:' || coalesce(v_group.topic, '') || ':1', 0));
+
+  select * into v_membership
+  from public.group_members
+  where id = p_membership_id
+  for update;
+
+  if p_paused then
+    if v_membership.status <> 'active' then
+      raise exception '这个席位当前不是活跃状态';
+    end if;
+
+    update public.group_members
+    set status = 'paused',
+        paused_at = now(),
+        pause_reason = left(coalesce(nullif(trim(p_reason), ''), '连续 7 天未完成周同步'), 300),
+        left_at = null
+    where id = p_membership_id;
+  else
+    if v_membership.status <> 'paused' then
+      raise exception '这个席位当前没有暂停';
+    end if;
+
+    if public.active_circle_count(v_membership.user_id, 'exploration') > 0 then
+      raise exception '该用户已经加入了另一个聊天 Circle';
+    end if;
+
+    if v_group.status not in ('forming', 'active', 'full')
+      or public.group_active_member_count(v_group.id) >= v_group.max_members then
+      raise exception '原 Circle 已满或已结束，请让用户自己恢复匹配';
+    end if;
+
+    perform set_config('app.allow_starter_reactivation', 'on', true);
+
+    update public.group_members
+    set status = 'active',
+        paused_at = null,
+        pause_reason = '',
+        left_at = null,
+        joined_at = now()
+    where id = p_membership_id;
+  end if;
+
+  perform public.refresh_group_status(v_group.id);
+end;
+$$;
+
+create or replace function public.reactivate_starter_seat(p_membership_id uuid)
+returns uuid
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_user_id uuid := auth.uid();
+  v_membership public.group_members%rowtype;
+  v_group public.groups%rowtype;
+  v_profile public.profiles%rowtype;
+  v_expected_role text;
+  v_expected_topic text;
+  v_new_group_id uuid;
+begin
+  if v_user_id is null then
+    raise exception 'Not authenticated';
+  end if;
+
+  perform pg_advisory_xact_lock(hashtextextended('chat-user:' || v_user_id::text, 0));
+
+  select * into v_membership
+  from public.group_members
+  where id = p_membership_id
+    and user_id = v_user_id
+    and status = 'paused'
+  for update;
+
+  if not found then
+    raise exception '没有找到可恢复的 Starter 席位';
+  end if;
+
+  select * into v_group from public.groups where id = v_membership.group_id;
+  select * into v_profile from public.profiles where id = v_user_id;
+
+  if coalesce(v_profile.level, 1) <> 1 then
+    raise exception '只有 Starter 席位可以通过此流程恢复';
+  end if;
+
+  if public.active_circle_count(v_user_id, 'exploration') > 0 then
+    raise exception '你已经加入了一个聊天 Circle';
+  end if;
+
+  v_expected_role := case
+    when lower(coalesce(v_profile.target_role, '')) = 'consulting' or v_profile.target_role = '咨询' then 'Consulting'
+    else 'Finance'
+  end;
+  v_expected_topic := (
+    case when v_profile.application_track = 'Summer Internship' then 'Summer' else 'Spring Week' end
+    || ' ' || public.stage_label(1)
+    || ' - ' || v_expected_role
+    || ' Circle'
+  );
+
+  if v_group.circle_type = 'exploration'
+    and v_group.level = 1
+    and v_group.topic = v_expected_topic
+    and v_group.status in ('forming', 'active', 'full')
+    and public.group_active_member_count(v_group.id) < v_group.max_members then
+    perform pg_advisory_xact_lock(hashtextextended('chat-circle:' || coalesce(v_group.topic, '') || ':1', 0));
+
+    perform set_config('app.allow_starter_reactivation', 'on', true);
+
+    update public.group_members
+    set status = 'active',
+        paused_at = null,
+        pause_reason = '',
+        left_at = null,
+        joined_at = now()
+    where id = p_membership_id;
+
+    perform public.refresh_group_status(v_group.id);
+    return v_group.id;
+  end if;
+
+  perform set_config('app.allow_starter_reactivation', 'on', true);
+
+  update public.group_members
+  set status = 'left',
+      left_at = now(),
+      paused_at = null
+  where id = p_membership_id;
+
+  select public.join_exploration_circle(v_expected_topic, 1) into v_new_group_id;
+  return v_new_group_id;
+end;
 $$;
 
 create or replace function public.active_circle_count(p_user_id uuid, p_circle_type text)
@@ -986,6 +1413,17 @@ begin
     return v_existing_group_id;
   end if;
 
+  if exists (
+    select 1
+    from public.group_members gm
+    join public.groups g on g.id = gm.group_id
+    where gm.user_id = v_user_id
+      and gm.status = 'paused'
+      and g.circle_type = 'exploration'
+  ) then
+    raise exception '你的 Starter 席位已暂停，请先恢复匹配';
+  end if;
+
   v_expected_topic := (
     case
       when coalesce(v_profile.application_track, '') = 'Summer Internship' then 'Summer'
@@ -1275,8 +1713,9 @@ begin
       and g.circle_type = 'exploration'
       and g.level = 1
       and g.topic = v_expected_topic
+      and public.group_active_member_count(g.id) >= 3
   ) then
-    raise exception '请先进入与当前申请路径和岗位匹配的 Starter Circle';
+    raise exception 'Starter Circle 至少有 3 名活跃成员后才能解锁 Ready';
   end if;
 
   if coalesce(v_profile.target_role, '') = ''
@@ -1975,8 +2414,8 @@ begin
     raise exception '周同步只用于长期聊天 Circle';
   end if;
 
-  if v_group_status not in ('active', 'full') then
-    raise exception 'Circle 凑齐 3 人后才能开始周同步';
+  if v_group_status not in ('forming', 'active', 'full') then
+    raise exception '这个 Circle 当前不能同步进度';
   end if;
 
   insert into public.weekly_checkins (
@@ -2171,6 +2610,7 @@ alter table public.tasks enable row level security;
 alter table public.groups enable row level security;
 alter table public.group_members enable row level security;
 alter table public.messages enable row level security;
+alter table public.group_read_states enable row level security;
 alter table public.task_submissions enable row level security;
 alter table public.task_submission_contributors enable row level security;
 alter table public.promotion_invites enable row level security;
@@ -2202,9 +2642,16 @@ revoke execute on function public.my_level() from public, anon;
 revoke execute on function public.is_admin(uuid) from public, anon;
 revoke execute on function public.my_is_admin() from public, anon;
 revoke execute on function public.protect_profile_admin_flag() from public, anon, authenticated;
+revoke execute on function public.protect_paused_chat_seat() from public, anon, authenticated;
 revoke execute on function public.is_group_member(uuid, uuid) from public, anon;
 revoke execute on function public.is_task_participant(uuid, uuid) from public, anon;
 revoke execute on function public.can_view_group(uuid, uuid) from public, anon;
+revoke execute on function public.can_view_group_content(uuid, uuid, timestamptz) from public, anon;
+revoke execute on function public.my_unread_group_counts() from public, anon;
+revoke execute on function public.mark_group_read(uuid, timestamptz) from public, anon;
+revoke execute on function public.admin_starter_memberships() from public, anon;
+revoke execute on function public.admin_set_starter_seat(uuid, boolean, text) from public, anon;
+revoke execute on function public.reactivate_starter_seat(uuid) from public, anon;
 revoke execute on function public.active_circle_count(uuid, text) from public, anon, authenticated;
 revoke execute on function public.stage_label(int) from public, anon, authenticated;
 revoke execute on function public.challenge_label(int) from public, anon, authenticated;
@@ -2234,6 +2681,12 @@ grant execute on function public.my_is_admin() to authenticated;
 grant execute on function public.is_group_member(uuid, uuid) to authenticated;
 grant execute on function public.is_task_participant(uuid, uuid) to authenticated;
 grant execute on function public.can_view_group(uuid, uuid) to authenticated;
+grant execute on function public.can_view_group_content(uuid, uuid, timestamptz) to authenticated;
+grant execute on function public.my_unread_group_counts() to authenticated;
+grant execute on function public.mark_group_read(uuid, timestamptz) to authenticated;
+grant execute on function public.admin_starter_memberships() to authenticated;
+grant execute on function public.admin_set_starter_seat(uuid, boolean, text) to authenticated;
+grant execute on function public.reactivate_starter_seat(uuid) to authenticated;
 grant execute on function public.can_view_submission(uuid, uuid) to authenticated;
 grant execute on function public.refresh_challenge_lifecycle() to authenticated;
 grant execute on function public.join_task_circle(uuid) to authenticated;
@@ -2252,6 +2705,8 @@ grant execute on function public.upsert_weekly_checkin(uuid, int, int, text, tex
 grant execute on function public.create_challenge_round(text, text, text, int, text, text, int, timestamptz, timestamptz) to authenticated;
 grant execute on function public.set_challenge_status(uuid, text) to authenticated;
 grant select on table public.task_submission_contributors to authenticated;
+revoke all privileges on table public.group_read_states from public, anon, authenticated;
+grant select on table public.group_read_states to authenticated;
 revoke insert, update, delete on table public.tasks from anon, authenticated;
 revoke insert, update, delete on table public.groups from anon, authenticated;
 revoke insert, update, delete on table public.group_members from anon, authenticated;
@@ -2330,7 +2785,7 @@ using (public.can_view_group(group_members.group_id, auth.uid()));
 create policy "messages_select_visible"
 on public.messages for select
 to authenticated
-using (public.can_view_group(messages.group_id, auth.uid()));
+using (public.can_view_group_content(messages.group_id, auth.uid(), messages.created_at));
 
 create policy "messages_insert_members"
 on public.messages for insert
@@ -2341,7 +2796,7 @@ with check (
   and exists (
     select 1 from public.groups g
     where g.id = messages.group_id
-      and (g.circle_type = 'task' or g.status in ('active', 'full'))
+      and (g.circle_type = 'task' or g.status in ('forming', 'active', 'full'))
   )
   and (
     (messages.message_type = 'text' and messages.media_path is null and messages.media_url is null)
@@ -2358,10 +2813,15 @@ with check (
   )
 );
 
+create policy "group_read_states_select_self"
+on public.group_read_states for select
+to authenticated
+using (user_id = auth.uid());
+
 create policy "weekly_checkins_select_visible"
 on public.weekly_checkins for select
 to authenticated
-using (public.can_view_group(weekly_checkins.group_id, auth.uid()));
+using (public.can_view_group_content(weekly_checkins.group_id, auth.uid(), weekly_checkins.updated_at));
 
 create policy "weekly_checkins_insert_self"
 on public.weekly_checkins for insert
@@ -2422,7 +2882,11 @@ on storage.objects for select
 to authenticated
 using (
   bucket_id = 'chat-media'
-  and public.can_view_group((storage.foldername(name))[1]::uuid, auth.uid())
+  and public.can_view_group_content(
+    (storage.foldername(name))[1]::uuid,
+    auth.uid(),
+    storage.objects.created_at
+  )
 );
 
 create policy "chat_media_insert_members"
@@ -2435,7 +2899,7 @@ with check (
   and exists (
     select 1 from public.groups g
     where g.id = (storage.foldername(name))[1]::uuid
-      and (g.circle_type = 'task' or g.status in ('active', 'full'))
+      and (g.circle_type = 'task' or g.status in ('forming', 'active', 'full'))
   )
 );
 
@@ -2616,1004 +3080,8 @@ on public.profile_endorsements for select
 to authenticated
 using (true);
 
--- Seed tasks. This is idempotent by title.
-insert into public.tasks (title, description, category, level, deliverable, score_max, group_size, duration_days, status)
-select * from (values
-  (
-    '分析新易盛未来五年的投资价值',
-    '请围绕收入增长、ASP、毛利率、客户集中度、AI CAPEX、估值隐含预期讨论 bull case 和 bear case。',
-    '股票分析',
-    3,
-    '提交一份 investment memo，包含 bull case、bear case、关键假设和估值隐含预期。',
-    100,
-    6,
-    7,
-    'open'
-  ),
-  (
-    '分析泡泡玛特是否还有十倍空间',
-    '请围绕 IP 生命周期、海外增长、渠道扩张、消费者动机、估值隐含假设讨论。',
-    '股票分析',
-    3,
-    '提交一份股票 pitch，说明核心驱动、主要风险和你们的结论。',
-    100,
-    6,
-    7,
-    'open'
-  ),
-  (
-    '为一家中国茶饮品牌设计英国市场进入策略',
-    '假设你是咨询顾问，请讨论目标客群、选址、定价、供应链、营销和前三个月开店计划。',
-    '咨询实践',
-    2,
-    '提交一份市场进入方案，包含目标客群、选址逻辑、定价和前三个月行动计划。',
-    100,
-    5,
-    5,
-    'open'
-  ),
-  (
-    '帮一家 AI 教育产品找到第一批用户',
-    '假设产品面向大学生求职训练，请设计冷启动路径、首批用户画像、渠道、转化和留存机制。',
-    'AI 产品 / 创业',
-    2,
-    '提交一份冷启动方案，包含首批用户画像、渠道、转化路径和留存机制。',
-    100,
-    5,
-    5,
-    'open'
-  ),
-  (
-    '模拟投行面试：如何解释 DCF',
-    '请小组互相模拟面试，讨论 DCF 的核心逻辑、关键假设、常见追问和简洁表达。',
-    '投行面试',
-    1,
-    '提交一份面试回答框架，包含 60 秒版本、关键假设和常见追问。',
-    100,
-    4,
-    3,
-    'open'
-  ),
-  (
-    'Consulting Sprint Challenge：为伦敦咖啡连锁设计增长和利润改善方案',
-    '你们是一支咨询团队，客户是一家在伦敦有 8 家门店的精品咖啡连锁。最近午后客流下降、外卖利润偏低、学生客群增长停滞。请先估算市场和核心客群，再提出能在 30 天内测试的增长与利润改善方案。',
-    '咨询实践',
-    1,
-    '提交一份 5-7 页 consulting mini-deck，包含 market sizing、问题树、核心假设、unit economics、3 个增长动作、30 天实验和成功指标。',
-    100,
-    4,
-    7,
-    'open'
-  ),
-  (
-    '改写一份 Spring Week 简历 bullet',
-    '请每位成员提供 2-3 条经历 bullet，小组互相修改，重点提升动词、量化结果和求职方向匹配度。',
-    '申请材料',
-    1,
-    '提交一份 before/after 简历 bullet 对照，说明修改逻辑和最终版本。',
-    100,
-    4,
-    3,
-    'open'
-  ),
-  (
-    '制定一周海外实习申请冲刺计划',
-    '请每位成员列出目标地区、目标岗位、本周申请数量、networking 数量和需要补的能力，小组互相检查是否现实。',
-    '求职策略',
-    1,
-    '提交一份一周申请冲刺计划，包含岗位清单、每日行动、networking 目标和复盘方式。',
-    100,
-    4,
-    3,
-    'open'
-  ),
-  (
-    '整理一份校友 networking 地图',
-    '请围绕目标地区和目标岗位，整理校友、学长学姐、社团和公司员工触达名单，并设计第一封消息。',
-    '求职策略',
-    2,
-    '提交一份 networking 地图，包含目标人群分层、触达优先级、私信模板和跟进节奏。',
-    100,
-    5,
-    5,
-    'open'
-  ),
-  (
-    '比较英国、香港、美国金融申请路径',
-    '请比较三个地区在招聘时间线、签证/身份、target school、networking、面试和岗位数量上的差异。',
-    '求职策略',
-    3,
-    '提交一份地区申请策略 memo，包含英港美路径对比、个人适配判断和未来 30 天行动。',
-    100,
-    6,
-    7,
-    'open'
-  ),
-  (
-    '模拟 HireVue：讲一个 leadership 故事',
-    '请用 STAR 框架准备一个 leadership 故事，小组互相追问并打磨到 90 秒以内。',
-    '投行面试',
-    1,
-    '提交一份 90 秒 behavioral answer，包含 STAR 结构和可能追问。',
-    100,
-    4,
-    3,
-    'open'
-  ),
-  (
-    'Spring Week 申请 tracker 搭建',
-    '请整理目标银行、岗位、截止日期、申请状态、HireVue 状态和复盘字段，小组互相检查是否覆盖完整。',
-    'Spring Week',
-    1,
-    '提交一份 Spring Week tracker 模板，包含目标公司、截止日期、当前状态、下一步动作和复盘字段。',
-    100,
-    4,
-    3,
-    'open'
-  ),
-  (
-    'Spring Week HireVue 高频题训练',
-    '请每位成员选择 2 道 behavioral 高频题，用 90 秒回答并让小组追问。',
-    'Spring Week',
-    1,
-    '提交一份 HireVue 回答包，包含 2 个 STAR 故事、90 秒版本和小组反馈。',
-    100,
-    4,
-    3,
-    'open'
-  ),
-  (
-    'Summer IB technical 第一轮自测',
-    '请围绕 accounting、valuation、DCF 和 M&A 各整理 3 道问题，小组互相模拟第一轮面试。',
-    'Summer 投行',
-    2,
-    '提交一份 technical 自测记录，包含至少 12 道题、回答框架、错题和下一步复习计划。',
-    100,
-    5,
-    5,
-    'open'
-  ),
-  (
-    'Summer Consulting case partner 训练',
-    '请两两配对完成一个 profitability 或 market entry case，并记录结构、假设、计算和反馈。',
-    'Summer 咨询',
-    2,
-    '提交一份 case 训练复盘，包含题目、结构图、关键计算、反馈和下一次训练目标。',
-    100,
-    5,
-    5,
-    'open'
-  ),
-  (
-    'Summer referral 冲刺计划',
-    '请围绕目标公司列出 20 个可触达人选，设计首封消息、跟进节奏和 referral 转化记录方式。',
-    'Summer Networking',
-    3,
-    '提交一份 referral 冲刺计划，包含目标名单、触达模板、跟进节奏、记录字段和一周目标。',
-    100,
-    6,
-    7,
-    'open'
-  ),
-  (
-    '拆解一个你喜欢的消费品牌',
-    '请选择一个消费品牌，从用户、产品、渠道、定价和增长方式拆解它为什么成立。',
-    '商业分析',
-    1,
-    '提交一份品牌拆解 memo，包含用户画像、产品定位、渠道和增长逻辑。',
-    100,
-    4,
-    4,
-    'open'
-  ),
-  (
-    '设计一个投行申请者的 networking 系统',
-    '请围绕目标名单、触达话术、跟进节奏、信息记录和 referral 转化设计一个可执行系统。',
-    '求职策略',
-    4,
-    '提交一份 networking operating system，包含目标分层、触达模板、跟进节奏和转化指标。',
-    100,
-    6,
-    7,
-    'open'
-  ),
-  (
-    '为一家 SaaS 公司设计中小企业获客方案',
-    '假设产品面向中小企业财务团队，请设计目标客群、渠道组合、销售漏斗、定价实验和前三个月执行计划。',
-    '产品增长',
-    4,
-    '提交一份 GTM 方案，包含 ICP、渠道、销售漏斗、定价假设和 90 天实验。',
-    100,
-    6,
-    7,
-    'open'
-  ),
-  (
-    '写一份半导体行业三页 pitch deck',
-    '请选择半导体产业链中的一个细分方向，整理行业结构、关键公司、核心驱动和投资机会。',
-    '股票分析',
-    4,
-    '提交一份三页 pitch deck，包含行业地图、核心驱动、推荐标的和风险。',
-    100,
-    6,
-    7,
-    'open'
-  ),
-  (
-    '评估一个求职社交产品的增长飞轮',
-    '请从用户分层、留存、内容供给、Challenge 激励、邀请机制和商业化角度评估 circle 类产品。',
-    '产品战略',
-    5,
-    '提交一份产品战略 memo，包含核心飞轮、关键风险、北极星指标和 90 天实验计划。',
-    100,
-    6,
-    7,
-    'open'
-  ),
-  (
-    '设计一个 AI 面试教练的商业化路径',
-    '假设你负责一个 AI 面试教练产品，请设计从免费工具到付费订阅的转化路径和定价策略。',
-    'AI 产品 / 创业',
-    5,
-    '提交一份商业化方案，包含用户分层、付费触发点、定价、留存和关键指标。',
-    100,
-    6,
-    7,
-    'open'
-  ),
-  (
-    '评估一家上市公司的资本配置质量',
-    '请选择一家公司，分析它过去五年的资本开支、回购、并购、分红和 ROIC 变化。',
-    '股票分析',
-    5,
-    '提交一份资本配置 memo，包含历史行为、管理层判断、ROIC 变化和投资结论。',
-    100,
-    6,
-    7,
-    'open'
-  ),
-  (
-    '设计一个校内求职社群的冷启动计划',
-    '假设你要在一所大学启动 circle，请设计种子用户、首批 Circle、Challenge 机制、邀请路径和留存动作。',
-    '社区增长',
-    5,
-    '提交一份校园冷启动计划，包含种子用户、首批 Challenge、邀请机制和 30 天增长节奏。',
-    100,
-    6,
-    7,
-    'open'
-  ),
-  (
-    '为一家精品咖啡连锁设计门店扩张模型',
-    '请围绕选址、单店模型、客单价、复购、人员成本和现金回收期搭建扩张判断框架。',
-    '咨询实践',
-    2,
-    '提交一份门店扩张模型框架，包含关键假设、单店经济性和扩张节奏建议。',
-    100,
-    5,
-    5,
-    'open'
-  ),
-  (
-    '给一家 AI 求职工具做竞品分析',
-    '请选择 3 个竞品，从目标用户、核心功能、定价、获客渠道和差异化切入点分析。',
-    'AI 产品 / 创业',
-    2,
-    '提交一份竞品分析，包含竞品矩阵、差异化机会和 MVP 功能建议。',
-    100,
-    5,
-    5,
-    'open'
-  ),
-  (
-    '搭建一个投行 technical 面试题库',
-    '请整理估值、会计、并购、杠杆收购四类常见问题，并给出简洁回答框架。',
-    '投行面试',
-    2,
-    '提交一份 technical 题库，包含至少 12 个问题、回答框架和常见追问。',
-    100,
-    5,
-    5,
-    'open'
-  ),
-  (
-    '写一份消费公司 one-page stock pitch',
-    '选择一家消费公司，用一页纸说明投资观点、增长驱动、估值、风险和催化剂。',
-    '股票分析',
-    2,
-    '提交一页 stock pitch，包含观点、驱动、估值、风险和催化剂。',
-    100,
-    5,
-    5,
-    'open'
-  ),
-  (
-    '分析一家奢侈品公司的中国增长风险',
-    '请围绕宏观消费、品牌势能、渠道、价格带和竞争格局分析一家奢侈品公司的中国风险。',
-    '股票分析',
-    3,
-    '提交一份风险分析 memo，包含核心风险、证据、反方观点和监测指标。',
-    100,
-    6,
-    7,
-    'open'
-  ),
-  (
-    '为一家跨境电商设计欧洲市场进入方案',
-    '请讨论目标国家、品类选择、物流、渠道、定价、合规和前三个月测试计划。',
-    '咨询实践',
-    3,
-    '提交一份欧洲市场进入方案，包含国家选择、渠道、物流、合规和测试计划。',
-    100,
-    6,
-    7,
-    'open'
-  ),
-  (
-    '设计一个实习申请 tracker',
-    '请设计一个能让用户管理申请、networking、面试和复盘的 tracker 结构。',
-    '求职策略',
-    3,
-    '提交一份申请 tracker 模板，包含字段设计、使用流程和复盘机制。',
-    100,
-    6,
-    5,
-    'open'
-  ),
-  (
-    '模拟咨询项目：降低一家餐饮连锁的外卖亏损',
-    '请用咨询项目方式拆解外卖亏损来源，并提出能在 60 天内测试的改善方案。',
-    '咨询实践',
-    3,
-    '提交一份利润改善方案，包含问题树、关键假设、数据需求和 60 天实验。',
-    100,
-    6,
-    7,
-    'open'
-  )
-) as v(title, description, category, level, deliverable, score_max, group_size, duration_days, status)
-where not exists (
-  select 1 from public.tasks t where t.title = v.title
-);
-
-insert into public.tasks (title, description, category, level, deliverable, score_max, group_size, duration_days, status)
-select * from (values
-  (
-    'Business Sense Challenge：拆解一家校园附近的消费品牌',
-    '选择一个你熟悉的消费品牌，从用户、产品、价格、渠道和增长方式解释它为什么成立，并指出一个可测试的增长机会。',
-    'Business Sense',
-    1,
-    '提交一页品牌拆解 memo，包含核心用户、产品定位、渠道、增长逻辑和一个改进实验。',
-    100,
-    4,
-    5,
-    'open'
-  ),
-  (
-    'Consulting Sprint Challenge：为伦敦咖啡连锁设计增长和利润改善方案',
-    '你们是一支咨询团队，客户是一家在伦敦有 8 家门店的精品咖啡连锁。最近午后客流下降、外卖利润偏低、学生客群增长停滞。请先估算市场和核心客群，再提出能在 30 天内测试的增长与利润改善方案。',
-    'Consulting Case',
-    1,
-    '提交一份 5-7 页 consulting mini-deck，包含 market sizing、问题树、核心假设、unit economics、3 个增长动作、30 天实验和成功指标。',
-    100,
-    4,
-    7,
-    'open'
-  ),
-  (
-    'Company Teardown Challenge：为什么 Duolingo 能增长',
-    '拆解 Duolingo 的用户增长、产品循环、变现方式和护城河，并判断它的增长是否可持续。',
-    'Business Sense',
-    1,
-    '提交一份 company teardown，包含增长飞轮、商业模式、风险和你的判断。',
-    100,
-    4,
-    5,
-    'open'
-  ),
-  (
-    'Consulting Challenge：为茶饮品牌设计英国市场进入方案',
-    '假设一家中国茶饮品牌要进入英国，请设计目标客群、城市选择、门店策略、定价和前三个月测试计划。',
-    'Consulting Project',
-    2,
-    '提交一份市场进入方案，包含目标客群、城市优先级、渠道、定价和 90 天行动计划。',
-    100,
-    5,
-    7,
-    'open'
-  ),
-  (
-    'Equity Research Challenge：写一页消费公司 stock pitch',
-    '选择一家消费公司，用一页纸说明投资观点、增长驱动、估值、风险和催化剂。',
-    'Equity Research',
-    2,
-    '提交一页 stock pitch，包含观点、驱动、估值、风险和催化剂。',
-    100,
-    5,
-    7,
-    'open'
-  ),
-  (
-    'AI Product Challenge：给 AI 求职工具做竞品分析',
-    '选择 3 个 AI 求职或面试工具，从目标用户、核心功能、定价、获客渠道和差异化切入点分析。',
-    'AI Product',
-    2,
-    '提交一份竞品分析，包含竞品矩阵、用户痛点、差异化机会和 MVP 建议。',
-    100,
-    5,
-    7,
-    'open'
-  ),
-  (
-    'Investment Memo Challenge：分析一家高增长公司的 upside/downside',
-    '选择一家高增长上市公司，写出 bull case、bear case、关键假设、估值隐含预期和你们的小组结论。',
-    'Investment Memo',
-    3,
-    '提交一份 investment memo，包含 bull case、bear case、关键假设、估值和结论。',
-    100,
-    6,
-    7,
-    'open'
-  ),
-  (
-    'Consulting Project Challenge：降低一家餐饮连锁的外卖亏损',
-    '用咨询项目方式拆解外卖亏损来源，并提出能在 60 天内测试的改善方案。',
-    'Consulting Project',
-    3,
-    '提交一份利润改善方案，包含问题树、关键假设、数据需求和 60 天实验。',
-    100,
-    6,
-    7,
-    'open'
-  ),
-  (
-    'Deal Analysis Challenge：评估一笔奢侈品并购是否合理',
-    '选择一笔奢侈品或消费行业并购，从战略逻辑、协同、估值、整合风险和回报角度判断是否值得做。',
-    'Deal Analysis',
-    3,
-    '提交一份 deal memo，包含交易逻辑、估值、协同、主要风险和投资判断。',
-    100,
-    6,
-    7,
-    'open'
-  ),
-  (
-    'GTM Challenge：为一家 SaaS 公司设计中小企业获客方案',
-    '假设产品面向中小企业财务团队，请设计 ICP、渠道组合、销售漏斗、定价实验和前三个月执行计划。',
-    'GTM Strategy',
-    3,
-    '提交一份 GTM 方案，包含 ICP、渠道、销售漏斗、定价假设和 90 天实验。',
-    100,
-    6,
-    7,
-    'open'
-  ),
-  (
-    'Sector Pitch Challenge：写一份半导体行业三页 pitch deck',
-    '选择半导体产业链中的一个细分方向，整理行业结构、关键公司、核心驱动和投资机会。',
-    'Sector Research',
-    3,
-    '提交一份三页 pitch deck，包含行业地图、核心驱动、推荐标的和风险。',
-    100,
-    6,
-    7,
-    'open'
-  ),
-  (
-    'M&A Challenge：为一家上市公司设计资本配置方案',
-    '选择一家上市公司，判断它未来更应该回购、分红、并购、加大资本开支还是降杠杆，并解释原因。',
-    'M&A / Capital Allocation',
-    3,
-    '提交一份资本配置 memo，包含现状诊断、可选方案、推荐动作、风险和预期效果。',
-    100,
-    6,
-    7,
-    'open'
-  ),
-  (
-    'Venture Challenge：设计 AI 面试教练商业化路径',
-    '假设你负责一个 AI 面试教练产品，请设计从免费工具到付费订阅的转化路径和定价策略。',
-    'AI Product / Venture',
-    3,
-    '提交一份商业化方案，包含用户分层、付费触发点、定价、留存和关键指标。',
-    100,
-    6,
-    7,
-    'open'
-  ),
-  (
-    'Community Growth Challenge：设计校内求职社群冷启动',
-    '假设你要在一所大学启动 circle，请设计种子用户、首批 Circle、挑战机制、邀请路径和留存动作。',
-    'Community Growth',
-    3,
-    '提交一份校园冷启动计划，包含种子用户、首批 Challenge、邀请机制和 30 天增长节奏。',
-    100,
-    6,
-    7,
-    'open'
-  ),
-  (
-    'Product Strategy Challenge：评估 circle 的增长飞轮',
-    '从用户分层、留存、内容供给、Challenge 激励、邀请机制和商业化角度评估 circle 类产品。',
-    'Product Strategy',
-    3,
-    '提交一份产品战略 memo，包含核心飞轮、关键风险、北极星指标和 90 天实验计划。',
-    100,
-    6,
-    7,
-    'open'
-  )
-) as v(title, description, category, level, deliverable, score_max, group_size, duration_days, status)
-where not exists (
-  select 1 from public.tasks t where t.title = v.title
-);
-
-update public.tasks
-set level = v.level,
-    deliverable = v.deliverable,
-    score_max = 100
-from (values
-  ('分析新易盛未来五年的投资价值', 3, '提交一份 investment memo，包含 bull case、bear case、关键假设和估值隐含预期。'),
-  ('分析泡泡玛特是否还有十倍空间', 3, '提交一份股票 pitch，说明核心驱动、主要风险和你们的结论。'),
-  ('为一家中国茶饮品牌设计英国市场进入策略', 2, '提交一份市场进入方案，包含目标客群、选址逻辑、定价和前三个月行动计划。'),
-  ('帮一家 AI 教育产品找到第一批用户', 2, '提交一份冷启动方案，包含首批用户画像、渠道、转化路径和留存机制。'),
-  ('模拟投行面试：如何解释 DCF', 1, '提交一份面试回答框架，包含 60 秒版本、关键假设和常见追问。'),
-  ('Consulting Sprint Challenge：为伦敦咖啡连锁设计增长和利润改善方案', 1, '提交一份 5-7 页 consulting mini-deck，包含 market sizing、问题树、核心假设、unit economics、3 个增长动作、30 天实验和成功指标。'),
-  ('改写一份 Spring Week 简历 bullet', 1, '提交一份 before/after 简历 bullet 对照，说明修改逻辑和最终版本。'),
-  ('制定一周海外实习申请冲刺计划', 1, '提交一份一周申请冲刺计划，包含岗位清单、每日行动、networking 目标和复盘方式。'),
-  ('Spring Week 申请 tracker 搭建', 1, '提交一份 Spring Week tracker 模板，包含目标公司、截止日期、当前状态、下一步动作和复盘字段。'),
-  ('Spring Week HireVue 高频题训练', 1, '提交一份 HireVue 回答包，包含 2 个 STAR 故事、90 秒版本和小组反馈。'),
-  ('整理一份校友 networking 地图', 2, '提交一份 networking 地图，包含目标人群分层、触达优先级、私信模板和跟进节奏。'),
-  ('Summer IB technical 第一轮自测', 2, '提交一份 technical 自测记录，包含至少 12 道题、回答框架、错题和下一步复习计划。'),
-  ('Summer Consulting case partner 训练', 2, '提交一份 case 训练复盘，包含题目、结构图、关键计算、反馈和下一次训练目标。'),
-  ('比较英国、香港、美国金融申请路径', 3, '提交一份地区申请策略 memo，包含英港美路径对比、个人适配判断和未来 30 天行动。'),
-  ('Summer referral 冲刺计划', 3, '提交一份 referral 冲刺计划，包含目标名单、触达模板、跟进节奏、记录字段和一周目标。'),
-  ('模拟 HireVue：讲一个 leadership 故事', 1, '提交一份 90 秒 behavioral answer，包含 STAR 结构和可能追问。'),
-  ('拆解一个你喜欢的消费品牌', 1, '提交一份品牌拆解 memo，包含用户画像、产品定位、渠道和增长逻辑。'),
-  ('为一家精品咖啡连锁设计门店扩张模型', 2, '提交一份门店扩张模型框架，包含关键假设、单店经济性和扩张节奏建议。'),
-  ('给一家 AI 求职工具做竞品分析', 2, '提交一份竞品分析，包含竞品矩阵、差异化机会和 MVP 功能建议。'),
-  ('搭建一个投行 technical 面试题库', 2, '提交一份 technical 题库，包含至少 12 个问题、回答框架和常见追问。'),
-  ('写一份消费公司 one-page stock pitch', 2, '提交一页 stock pitch，包含观点、驱动、估值、风险和催化剂。'),
-  ('分析一家奢侈品公司的中国增长风险', 3, '提交一份风险分析 memo，包含核心风险、证据、反方观点和监测指标。'),
-  ('为一家跨境电商设计欧洲市场进入方案', 3, '提交一份欧洲市场进入方案，包含国家选择、渠道、物流、合规和测试计划。'),
-  ('设计一个实习申请 tracker', 3, '提交一份申请 tracker 模板，包含字段设计、使用流程和复盘机制。'),
-  ('模拟咨询项目：降低一家餐饮连锁的外卖亏损', 3, '提交一份利润改善方案，包含问题树、关键假设、数据需求和 60 天实验。'),
-  ('设计一个投行申请者的 networking 系统', 3, '提交一份 networking operating system，包含目标分层、触达模板、跟进节奏和转化指标。'),
-  ('为一家 SaaS 公司设计中小企业获客方案', 3, '提交一份 GTM 方案，包含 ICP、渠道、销售漏斗、定价假设和 90 天实验。'),
-  ('写一份半导体行业三页 pitch deck', 3, '提交一份三页 pitch deck，包含行业地图、核心驱动、推荐标的和风险。'),
-  ('评估一个求职社交产品的增长飞轮', 3, '提交一份产品战略 memo，包含核心飞轮、关键风险、北极星指标和 90 天实验计划。'),
-  ('设计一个 AI 面试教练的商业化路径', 3, '提交一份商业化方案，包含用户分层、付费触发点、定价、留存和关键指标。'),
-  ('评估一家上市公司的资本配置质量', 3, '提交一份资本配置 memo，包含历史行为、管理层判断、ROIC 变化和投资结论。'),
-  ('设计一个校内求职社群的冷启动计划', 3, '提交一份校园冷启动计划，包含种子用户、首批 Challenge、邀请机制和 30 天增长节奏。')
-) as v(title, level, deliverable)
-where public.tasks.title = v.title;
-
-update public.tasks
-set level = 3
-where level > 3;
-
-update public.profiles
-set level = 3,
-    updated_at = now()
-where application_track = 'Spring Week'
-  and level > 3;
-
-update public.tasks
-set format_guide = '建议格式：1. 一句话结论；2. 背景和目标；3. 核心分析；4. 可执行方案；5. 风险和下一步。提交链接可以是 Google Doc、Notion、PDF、Slides 或其他公开可访问材料。'
-where format_guide is null
-   or format_guide = ''
-   or format_guide = '建议格式：1. 结论摘要；2. 关键假设；3. 分析过程；4. 风险和下一步。提交链接可以是 Google Doc、Notion、PDF、Slides 或其他可访问材料。';
-
-update public.tasks
-set title = 'Consulting Sprint Challenge：为伦敦咖啡连锁设计增长和利润改善方案',
-    description = '你们是一支咨询团队，客户是一家在伦敦有 8 家门店的精品咖啡连锁。最近午后客流下降、外卖利润偏低、学生客群增长停滞。请先估算市场和核心客群，再提出能在 30 天内测试的增长与利润改善方案。',
-    category = 'Consulting Case',
-    deliverable = '提交一份 5-7 页 consulting mini-deck，包含 market sizing、问题树、核心假设、unit economics、3 个增长动作、30 天实验和成功指标。',
-    format_guide = '建议格式：1. Executive summary；2. Market sizing 和客群拆分；3. 问题树和关键假设；4. 门店 / 外卖 unit economics；5. 三个增长或利润改善动作；6. 30 天测试计划；7. KPI、风险和下一步。',
-    duration_days = 7,
-    group_size = 4,
-    status = 'open'
-where title in (
-  '模拟咨询 Case：估算伦敦一年卖出多少杯咖啡',
-  'Market Sizing Challenge：估算伦敦一年卖出多少杯咖啡'
-);
-
-update public.tasks
-set status = 'archived'
-where title in (
-  '改写一份 Spring Week 简历 bullet',
-  '制定一周海外实习申请冲刺计划',
-  '整理一份校友 networking 地图',
-  '比较英国、香港、美国金融申请路径',
-  '模拟 HireVue：讲一个 leadership 故事',
-  'Spring Week 申请 tracker 搭建',
-  'Spring Week HireVue 高频题训练',
-  'Summer IB technical 第一轮自测',
-  'Summer Consulting case partner 训练',
-  'Summer referral 冲刺计划',
-  '模拟投行面试：如何解释 DCF',
-  '搭建一个投行 technical 面试题库',
-  '设计一个实习申请 tracker',
-  '设计一个投行申请者的 networking 系统'
-)
-and starts_at is null
-and ends_at is null;
-
-update public.tasks
-set status = case
-  when title in (
-    'Consulting Sprint Challenge：为伦敦咖啡连锁设计增长和利润改善方案',
-    'Investment Memo Challenge：分析一家高增长公司的 upside/downside'
-  ) then 'open'
-  else 'archived'
-end
-where status in ('open', 'archived')
-  and starts_at is null
-  and ends_at is null;
-
-update public.tasks
-set is_featured = title in (
-      'Consulting Sprint Challenge：为伦敦咖啡连锁设计增长和利润改善方案',
-      'Investment Memo Challenge：分析一家高增长公司的 upside/downside'
-    ),
-    starts_at = case
-      when title in (
-        'Consulting Sprint Challenge：为伦敦咖啡连锁设计增长和利润改善方案',
-        'Investment Memo Challenge：分析一家高增长公司的 upside/downside'
-      ) then date_trunc('week', now())
-      else starts_at
-    end,
-    ends_at = case
-      when title in (
-        'Consulting Sprint Challenge：为伦敦咖啡连锁设计增长和利润改善方案',
-        'Investment Memo Challenge：分析一家高增长公司的 upside/downside'
-      ) then date_trunc('week', now()) + interval '7 days'
-      else ends_at
-    end
-where starts_at is null
-  and ends_at is null;
-
-with ranked_duplicates as (
-  select
-    t.id,
-    row_number() over (
-      partition by t.title
-      order by
-        (select count(*) from public.task_submissions ts where ts.task_id = t.id) desc,
-        (select count(*) from public.groups g where g.task_id = t.id) desc,
-        t.created_at asc,
-        t.id
-    ) as duplicate_rank
-  from public.tasks t
-)
-update public.tasks t
-set status = 'archived',
-    is_featured = false
-from ranked_duplicates d
-where t.id = d.id
-  and d.duplicate_rank > 1;
-
-update public.groups g
-set level = t.level
-from public.tasks t
-where g.task_id = t.id
-  and g.circle_type = 'task';
-
-update public.groups
-set level = 3
-where circle_type = 'task'
-  and level > 3;
-
-select public.refresh_challenge_lifecycle();
-
--- Current pilot Challenge. Keep one featured competition visible while preserving
--- any older Challenge that already has active participants.
-insert into public.tasks (
-  title, description, category, level, deliverable, format_guide,
-  score_max, group_size, duration_days, is_featured, starts_at, ends_at, status
-)
-select
-  'Market Entry Challenge：瑞幸咖啡是否应该进入英国市场？',
-  E'项目背景\n假设时间为 2027 年。瑞幸通过数字化点单、高频新品、优惠定价和小型取餐店快速扩张，并已开始进入中国以外的市场。英国的咖啡消费习惯成熟，但 Starbucks、Costa、Pret、Blank Street 和大量独立咖啡店已经占据了不同价格带和消费场景。\n\n管理层问题\n请作为瑞幸的市场进入项目组，判断英国是否值得进入。如果进入，请明确目标用户、首发城市、门店形式、价格定位和 90 天试点计划；如果不建议进入，说明关键原因和重新评估的触发条件。',
-  'Market Entry',
-  2,
-  '提交一份 6 页以内的市场进入 deck（PPT 或 PDF），必须包含明确结论、简化单店经济模型和 90 天试点计划。Excel 模型可作为可选附件。',
-  E'建议结构\n1. Executive summary：明确回答进入、暂缓或放弃，并列出三个核心理由。\n2. 市场与用户：分析英国咖啡市场、消费场景和最值得切入的目标用户。\n3. 竞争与定位：比较 Starbucks、Costa、Pret、Blank Street 和独立咖啡店，说明瑞幸的差异化。\n4. 进入模式：选择首发城市、自营或合作、堂食或取餐店、价格和获客方式。\n5. 单店经济模型：估算客单价、每日订单、租金、人工、原材料和盈亏平衡点。\n6. 风险与试点：提出 90 天试点、成功指标、主要风险和终止条件。\n\n提交规则\n所有关键数字需注明来源或假设；可以使用 AI，但团队需对数据和结论负责。\n\n评选原则\n证据是否可靠、逻辑是否清晰、方案是否可执行、财务判断是否合理。截止后只公布第一名、第二名和第三名。',
-  100,
-  4,
-  22,
-  true,
-  now(),
-  '2026-10-15 23:59:00+08'::timestamptz,
-  'open'
-where not exists (
-  select 1
-  from public.tasks
-  where title = 'Market Entry Challenge：瑞幸咖啡是否应该进入英国市场？'
-);
-
-update public.tasks
-set description = E'项目背景\n假设时间为 2027 年。瑞幸通过数字化点单、高频新品、优惠定价和小型取餐店快速扩张，并已开始进入中国以外的市场。英国的咖啡消费习惯成熟，但 Starbucks、Costa、Pret、Blank Street 和大量独立咖啡店已经占据了不同价格带和消费场景。\n\n管理层问题\n请作为瑞幸的市场进入项目组，判断英国是否值得进入。如果进入，请明确目标用户、首发城市、门店形式、价格定位和 90 天试点计划；如果不建议进入，说明关键原因和重新评估的触发条件。',
-    category = 'Market Entry',
-    level = 2,
-    deliverable = '提交一份 6 页以内的市场进入 deck（PPT 或 PDF），必须包含明确结论、简化单店经济模型和 90 天试点计划。Excel 模型可作为可选附件。',
-    format_guide = E'建议结构\n1. Executive summary：明确回答进入、暂缓或放弃，并列出三个核心理由。\n2. 市场与用户：分析英国咖啡市场、消费场景和最值得切入的目标用户。\n3. 竞争与定位：比较 Starbucks、Costa、Pret、Blank Street 和独立咖啡店，说明瑞幸的差异化。\n4. 进入模式：选择首发城市、自营或合作、堂食或取餐店、价格和获客方式。\n5. 单店经济模型：估算客单价、每日订单、租金、人工、原材料和盈亏平衡点。\n6. 风险与试点：提出 90 天试点、成功指标、主要风险和终止条件。\n\n提交规则\n所有关键数字需注明来源或假设；可以使用 AI，但团队需对数据和结论负责。\n\n评选原则\n证据是否可靠、逻辑是否清晰、方案是否可执行、财务判断是否合理。截止后只公布第一名、第二名和第三名。',
-    score_max = 100,
-    group_size = 4,
-    duration_days = 22,
-    is_featured = true,
-    starts_at = coalesce(starts_at, now()),
-    ends_at = '2026-10-15 23:59:00+08'::timestamptz,
-    status = 'open'
-where title = 'Market Entry Challenge：瑞幸咖啡是否应该进入英国市场？';
-
-update public.tasks
-set is_featured = title = 'Market Entry Challenge：瑞幸咖啡是否应该进入英国市场？'
-where status = 'open';
-
-update public.groups g
-set level = coalesce(member_levels.level, g.level)
-from (
-  select gm.group_id, min(p.level) as level
-  from public.group_members gm
-  join public.profiles p on p.id = gm.user_id
-  where gm.status = 'active'
-  group by gm.group_id
-) member_levels
-where g.id = member_levels.group_id
-  and g.circle_type = 'exploration';
-
-update public.groups
-set level = 3,
-    name = replace(replace(name, 'Peer Lead', 'Competitive'), 'Mentor', 'Competitive')
-where circle_type = 'exploration'
-  and (topic ilike 'Spring Week%' or topic ilike 'Summer%')
-  and level > 3;
-
--- Region is no longer part of chat matching. Keep the old profile column only for compatibility.
-update public.groups
-set topic = regexp_replace(topic, ' - (英国|美国|香港|新加坡) ', ' - '),
-    name = regexp_replace(name, ' - (英国|美国|香港|新加坡) ', ' - ')
-where circle_type = 'exploration'
-  and (
-    topic ~ ' - (英国|美国|香港|新加坡) '
-    or name ~ ' - (英国|美国|香港|新加坡) '
-  );
-
-update public.groups
-set topic = regexp_replace(
-      topic,
-      '(Investment Banking|Asset Management|Sales & Trading|Equity Research|General Finance)( Circle)',
-      'Finance\2',
-      'g'
-    ),
-    name = regexp_replace(
-      name,
-      '(Investment Banking|Asset Management|Sales & Trading|Equity Research|General Finance)( Circle)',
-      'Finance\2',
-      'g'
-    )
-where circle_type = 'exploration'
-  and (
-    topic ~ '(Investment Banking|Asset Management|Sales & Trading|Equity Research|General Finance) Circle'
-    or name ~ '(Investment Banking|Asset Management|Sales & Trading|Equity Research|General Finance) Circle'
-  );
-
-update public.circle_requests
-set topic = regexp_replace(topic, ' - (英国|美国|香港|新加坡) ', ' - '),
-    target_region = '不限地区',
-    updated_at = now()
-where target_region <> '不限地区'
-   or topic ~ ' - (英国|美国|香港|新加坡) ';
-
-update public.circle_requests
-set topic = regexp_replace(
-      topic,
-      '(Investment Banking|Asset Management|Sales & Trading|Equity Research|General Finance)( Circle)',
-      'Finance\2',
-      'g'
-    ),
-    target_role = case when lower(target_role) = 'consulting' then 'Consulting' else 'Finance' end,
-    updated_at = now()
-where target_role not in ('Finance', 'Consulting')
-   or topic ~ '(Investment Banking|Asset Management|Sales & Trading|Equity Research|General Finance) Circle';
-
-update public.groups
-set name = replace(
-  replace(
-    replace(
-      replace(
-        replace(name, ' L1 Circle', ' · Starter Circle'),
-        ' L2 Circle', ' · Ready Circle'
-      ),
-      ' L3 Circle', ' · Competitive Circle'
-    ),
-    ' L4 Circle', ' · Competitive Circle'
-  ),
-  ' L5 Circle', ' · Competitive Circle'
-)
-where name ~ ' L[1-5] Circle';
-
-update public.groups
-set name = replace(
-  replace(
-    replace(
-      replace(
-        replace(name, 'Starter Circle', '入门难度 Circle'),
-        'Ready Circle', '进阶难度 Circle'
-      ),
-      'Competitive Circle', '高阶难度 Circle'
-    ),
-    'Peer Lead Circle', '高阶难度 Circle'
-  ),
-  'Mentor Circle', '高阶难度 Circle'
-)
-where circle_type = 'task';
-
-update public.groups
-set name = replace(replace(name, '专家难度 Circle', '高阶难度 Circle'), '开放命题 Circle', '高阶难度 Circle')
-where circle_type = 'task';
-
--- Remove the old showcase demo accounts, teams and submissions. Deleting the
--- groups first cascades to their submissions and contributor records.
-delete from public.groups
-where id in (
-  '00000000-0000-4000-8000-000000000101',
-  '00000000-0000-4000-8000-000000000102',
-  '00000000-0000-4000-8000-000000000103',
-  '00000000-0000-4000-8000-000000000104',
-  '00000000-0000-4000-8000-000000000105'
-);
-
-delete from auth.users
-where id in (
-  '00000000-0000-4000-8000-000000000001',
-  '00000000-0000-4000-8000-000000000002',
-  '00000000-0000-4000-8000-000000000003',
-  '00000000-0000-4000-8000-000000000004',
-  '00000000-0000-4000-8000-000000000005'
-);
-
-/* Retained only as migration history. Do not recreate virtual showcase data.
--- Demo production-like data for the showcase page.
--- These rows live in Supabase tables, so the app reads them as real submissions instead of frontend-only examples.
-insert into auth.users (
-  id,
-  aud,
-  role,
-  email,
-  email_confirmed_at,
-  raw_app_meta_data,
-  raw_user_meta_data,
-  created_at,
-  updated_at
-)
-values
-  ('00000000-0000-4000-8000-000000000001', 'authenticated', 'authenticated', 'circle.demo.buffett@163.com', now(), '{"provider":"email","providers":["email"]}', '{"display_name":"巴菲特"}', now() - interval '8 days', now() - interval '8 days'),
-  ('00000000-0000-4000-8000-000000000002', 'authenticated', 'authenticated', 'circle.demo.lahuo@163.com', now(), '{"provider":"email","providers":["email"]}', '{"display_name":"喇货"}', now() - interval '7 days', now() - interval '7 days'),
-  ('00000000-0000-4000-8000-000000000003', 'authenticated', 'authenticated', 'circle.demo.kong@163.com', now(), '{"provider":"email","providers":["email"]}', '{"display_name":"孔子恒"}', now() - interval '6 days', now() - interval '6 days'),
-  ('00000000-0000-4000-8000-000000000004', 'authenticated', 'authenticated', 'circle.demo.zhou@163.com', now(), '{"provider":"email","providers":["email"]}', '{"display_name":"周同学"}', now() - interval '5 days', now() - interval '5 days'),
-  ('00000000-0000-4000-8000-000000000005', 'authenticated', 'authenticated', 'circle.demo.senior@163.com', now(), '{"provider":"email","providers":["email"]}', '{"display_name":"高阶同学"}', now() - interval '4 days', now() - interval '4 days')
-on conflict (id) do nothing;
-
-insert into public.profiles (
-  id,
-  email,
-  display_name,
-  stage,
-  direction,
-  application_track,
-  target_region,
-  target_role,
-  application_progress,
-  intensity,
-  bio,
-  level,
-  created_at,
-  updated_at
-)
-values
-  ('00000000-0000-4000-8000-000000000001', 'circle.demo.buffett@163.com', '巴菲特', 'Competitive', 'Equity Research', 'Summer Internship', '英国', 'Equity Research', '投递中', '高强度冲刺', '模拟用户：专注股票研究和投资 memo。', 3, now() - interval '8 days', now() - interval '1 day'),
-  ('00000000-0000-4000-8000-000000000002', 'circle.demo.lahuo@163.com', '喇货', 'Ready', 'Consulting', 'Summer Internship', '英国', 'Consulting', '投递中', '高强度冲刺', '模拟用户：专注咨询 case 和市场进入策略。', 2, now() - interval '7 days', now() - interval '2 days'),
-  ('00000000-0000-4000-8000-000000000003', 'circle.demo.kong@163.com', '孔子恒', 'Starter', 'Business Sense', 'Spring Week', '英国', 'Investment Banking', '材料准备中', '正常推进', '模拟用户：正在准备 Spring Week 和 business sense。', 1, now() - interval '6 days', now() - interval '3 days'),
-  ('00000000-0000-4000-8000-000000000004', 'circle.demo.zhou@163.com', '周同学', 'Ready', 'AI Product', 'Summer Internship', '英国', 'General Finance', '投递中', '正常推进', '模拟用户：关注 AI 产品和求职工具。', 2, now() - interval '5 days', now() - interval '4 days'),
-  ('00000000-0000-4000-8000-000000000005', 'circle.demo.senior@163.com', '高阶同学', 'Competitive', 'Investment Research', 'Summer Internship', '英国', 'Equity Research', '面试中', '高强度冲刺', '模拟用户：Competitive，负责高质量研究输出。', 3, now() - interval '4 days', now() - interval '1 day')
-on conflict (id) do nothing;
-
-insert into public.groups (id, task_id, name, circle_type, topic, level, max_members, status, created_at)
-values
-  ('00000000-0000-4000-8000-000000000101', (select id from public.tasks where title = '分析泡泡玛特是否还有十倍空间' limit 1), '泡泡玛特十倍空间 · 高阶难度 Circle', 'task', '分析泡泡玛特是否还有十倍空间', 3, 6, 'active', now() - interval '7 days'),
-  ('00000000-0000-4000-8000-000000000102', (select id from public.tasks where title = '为一家中国茶饮品牌设计英国市场进入策略' limit 1), '英国茶饮进入策略 · 进阶难度 Circle', 'task', '为一家中国茶饮品牌设计英国市场进入策略', 2, 5, 'active', now() - interval '6 days'),
-  ('00000000-0000-4000-8000-000000000103', (select id from public.tasks where title = 'Consulting Sprint Challenge：为伦敦咖啡连锁设计增长和利润改善方案' limit 1), '伦敦咖啡增长利润改善 · 入门难度 Circle', 'task', 'Consulting Sprint Challenge：为伦敦咖啡连锁设计增长和利润改善方案', 1, 4, 'active', now() - interval '5 days'),
-  ('00000000-0000-4000-8000-000000000104', (select id from public.tasks where title = '帮一家 AI 教育产品找到第一批用户' limit 1), 'AI 教育产品冷启动 · 进阶难度 Circle', 'task', '帮一家 AI 教育产品找到第一批用户', 2, 5, 'active', now() - interval '4 days'),
-  ('00000000-0000-4000-8000-000000000105', (select id from public.tasks where title = '写一份半导体行业三页 pitch deck' limit 1), '半导体行业 Pitch Deck · 高阶难度 Circle', 'task', '写一份半导体行业三页 pitch deck', 3, 6, 'active', now() - interval '3 days')
-on conflict (id) do nothing;
-
-insert into public.group_members (group_id, user_id, role, status, joined_at)
-values
-  ('00000000-0000-4000-8000-000000000101', '00000000-0000-4000-8000-000000000001', 'member', 'active', now() - interval '7 days'),
-  ('00000000-0000-4000-8000-000000000102', '00000000-0000-4000-8000-000000000002', 'member', 'active', now() - interval '6 days'),
-  ('00000000-0000-4000-8000-000000000103', '00000000-0000-4000-8000-000000000003', 'member', 'active', now() - interval '5 days'),
-  ('00000000-0000-4000-8000-000000000104', '00000000-0000-4000-8000-000000000004', 'member', 'active', now() - interval '4 days'),
-  ('00000000-0000-4000-8000-000000000105', '00000000-0000-4000-8000-000000000005', 'host', 'active', now() - interval '3 days')
-on conflict (group_id, user_id) do nothing;
-
-insert into public.task_submissions (task_id, group_id, submitted_by, title, submission_url, content, score, award_rank, award_title, created_at)
-values
-  (
-    (select id from public.tasks where title = '分析泡泡玛特是否还有十倍空间' limit 1),
-    '00000000-0000-4000-8000-000000000101',
-    '00000000-0000-4000-8000-000000000001',
-    '泡泡玛特是否还有十倍空间 stock pitch',
-    'https://docs.google.com/document/d/demo-popmart-stock-pitch',
-    '我们认为泡泡玛特继续增长的关键不只是门店扩张，而是 IP 生命周期管理、海外市场复制能力和高毛利新品类延展。小队拆解了 bull case、bear case、估值隐含预期和三个需要持续跟踪的风险指标。',
-    0,
-    1,
-    null,
-    now() - interval '1 day'
-  ),
-  (
-    (select id from public.tasks where title = '为一家中国茶饮品牌设计英国市场进入策略' limit 1),
-    '00000000-0000-4000-8000-000000000102',
-    '00000000-0000-4000-8000-000000000002',
-    '英国茶饮品牌前三个月进入方案',
-    'https://www.notion.so/demo-uk-bubble-tea-market-entry',
-    '我们建议先从伦敦学生和亚洲办公室人群切入，用快闪店验证 SKU、价格带和复购，再决定正式门店位置。交付包含城市排序、选址逻辑、菜单假设、营销渠道和 90 天测试计划。',
-    0,
-    2,
-    null,
-    now() - interval '2 days'
-  ),
-  (
-    (select id from public.tasks where title = 'Consulting Sprint Challenge：为伦敦咖啡连锁设计增长和利润改善方案' limit 1),
-    '00000000-0000-4000-8000-000000000103',
-    '00000000-0000-4000-8000-000000000003',
-    '伦敦咖啡连锁增长和利润改善 mini-deck',
-    'https://docs.google.com/presentation/d/demo-london-coffee-growth-profit',
-    '我们先估算伦敦精品咖啡核心客群，再拆出午后客流下降、外卖毛利偏低和学生客群增长停滞三个问题。最终方案包含会员午后组合、办公室团购、外卖菜单重构三个动作，并给出 30 天实验、KPI 和 unit economics 测算。',
-    0,
-    null,
-    null,
-    now() - interval '3 days'
-  ),
-  (
-    (select id from public.tasks where title = '帮一家 AI 教育产品找到第一批用户' limit 1),
-    '00000000-0000-4000-8000-000000000104',
-    '00000000-0000-4000-8000-000000000004',
-    'AI 教育产品第一批用户冷启动',
-    'https://www.notion.so/demo-ai-education-cold-start',
-    '小队把目标用户拆成求职焦虑高、愿意尝试工具、缺少同伴反馈的学生，并设计了校园 ambassador、免费 mock、作品展示和 referral loop 四个冷启动动作。',
-    0,
-    null,
-    null,
-    now() - interval '4 days'
-  ),
-  (
-    (select id from public.tasks where title = '写一份半导体行业三页 pitch deck' limit 1),
-    '00000000-0000-4000-8000-000000000105',
-    '00000000-0000-4000-8000-000000000005',
-    '半导体设备行业三页 pitch deck',
-    'https://docs.google.com/presentation/d/demo-semiconductor-sector-pitch',
-    '我们从先进制程、国产替代、资本开支周期和客户集中度四个角度拆解半导体设备行业，并给出一个推荐标的、两个风险指标和一个反方观点。',
-    0,
-    1,
-    null,
-    now() - interval '5 days'
-  )
-on conflict (group_id) do nothing;
-
-insert into public.task_submission_contributors (submission_id, user_id)
-select ts.id, gm.user_id
-from public.task_submissions ts
-join public.group_members gm on gm.group_id = ts.group_id and gm.status = 'active'
-where not exists (
-  select 1
-  from public.task_submission_contributors existing
-  where existing.submission_id = ts.id
-)
-on conflict (submission_id, user_id) do nothing;
-*/
-
+-- Production starts without demo users, demo Circles or seeded Challenges.
+-- Create real Challenge rounds from the operator console.
 do $$
 begin
   alter publication supabase_realtime add table public.messages;
